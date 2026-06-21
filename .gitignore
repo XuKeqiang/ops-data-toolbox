@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+node_modules/
+
+# Local runtime data and credentials
+data/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+
+# Business source files and generated exports
+*.pdf
+*.csv
+*.xlsx
+*.xls
+*.zip
+
+# Logs and temporary files
+*.log
+tmp/

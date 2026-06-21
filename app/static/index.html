@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Amazon Operations Toolbox</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260621-shipment-package" />
+  </head>
+  <body>
+    <section id="loginScreen" class="login-screen hidden" aria-label="登录">
+      <form id="loginForm" class="login-panel">
+        <div class="brand-mark">A</div>
+        <div>
+          <p class="kicker">AMAZON TOOLBOX</p>
+          <h1>登录经营工具箱</h1>
+        </div>
+        <label for="loginUsername">用户名</label>
+        <input id="loginUsername" type="text" autocomplete="username" placeholder="admin" />
+        <label for="loginPassword">密码</label>
+        <input id="loginPassword" type="password" autocomplete="current-password" placeholder="admin123" />
+        <button class="button accent" type="submit">登录</button>
+        <p id="loginStatus" class="status-text">首次启动默认管理员：admin / admin123</p>
+      </form>
+    </section>
+
+    <header id="masthead" class="masthead hidden">
+      <div class="masthead-brand">
+        <div class="brand-mark">A</div>
+        <div>
+          <strong>Amazon 经营工具箱</strong>
+          <span>Internal operations</span>
+        </div>
+      </div>
+      <div class="masthead-actions">
+        <div id="userBadge" class="user-badge"></div>
+        <div id="exportMenu" class="export-menu">
+          <button id="exportMenuButton" class="button secondary" type="button" aria-haspopup="true" aria-expanded="false" disabled>
+            导出
+          </button>
+          <div class="export-menu-list" role="menu" aria-label="导出格式">
+            <a id="exportCsv" class="export-menu-item disabled" href="#" role="menuitem">CSV 文件</a>
+            <a id="exportXlsx" class="export-menu-item disabled" href="#" role="menuitem">Excel 工作簿</a>
+          </div>
+        </div>
+        <button id="logoutButton" class="button secondary" type="button">退出</button>
+      </div>
+    </header>
+
+    <div class="shell hidden" id="appShell">
+      <aside class="sidebar" aria-label="模块导航">
+        <div class="brand">
+          <span class="section-label">WORKFLOWS</span>
+        </div>
+        <nav class="nav">
+          <button class="nav-item active" type="button" data-view="shipment">货件PDF处理</button>
+          <button class="nav-item" type="button" data-view="report">交易报告PDF</button>
+          <button class="nav-item" type="button" disabled>交易明细CSV</button>
+          <button class="nav-item" type="button" data-view="history">历史任务</button>
+          <button class="nav-item" type="button" data-view="settings">设置</button>
+        </nav>
+        <div class="sidebar-note">
+          <span class="section-label">STATUS</span>
+          <strong>Alpha</strong>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section id="shipmentView" class="view-panel" data-view-panel="shipment">
+          <header class="topbar">
+            <div>
+              <p class="kicker">SHIPMENT PDFS</p>
+              <h1>外箱标识别与规范命名</h1>
+            </div>
+            <div class="topbar-actions">
+              <button id="packageButton" class="button accent" type="button" disabled>按工厂打包</button>
+              <button id="renameButton" class="button secondary" type="button" disabled>确认重命名</button>
+            </div>
+          </header>
+
+          <section class="input-band" aria-label="批次导入">
+            <form id="uploadForm" class="dropzone">
+              <input id="fileInput" name="files" type="file" accept="application/pdf" multiple />
+              <div>
+                <strong>上传一批货件 PDF</strong>
+                <span>PDF · Multiple files</span>
+              </div>
+              <button class="button accent" type="submit">上传并识别</button>
+            </form>
+
+            <form id="folderForm" class="folder-form">
+              <label for="folderInput">服务器文件夹路径</label>
+              <div class="inline-control">
+                <input id="folderInput" type="text" value="/Users/xukeqiang/Documents/Amazon_Data_Management/20260619" />
+                <button class="button primary" type="submit">扫描文件夹</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="table-panel">
+            <div class="panel-header">
+              <div>
+                <h2>识别结果</h2>
+                <p id="batchLabel">尚未扫描批次</p>
+              </div>
+              <div id="statusText" class="status-text">等待导入</div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>原文件名</th>
+                    <th>工厂</th>
+                    <th>SKU</th>
+                    <th>产品名</th>
+                    <th>国家</th>
+                    <th>仓库</th>
+                    <th>FBA编码</th>
+                    <th>箱/件</th>
+                    <th>文件名信息</th>
+                    <th>状态</th>
+                    <th>建议文件名</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="resultBody">
+                  <tr>
+                    <td class="empty" colspan="12">扫描或上传一批 PDF 后，识别结果会显示在这里。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="packageResult" class="package-result hidden"></div>
+          </section>
+        </section>
+
+        <section id="reportView" class="view-panel hidden" data-view-panel="report">
+          <header class="topbar">
+            <div>
+              <p class="kicker">TRANSACTION REPORT PDFS</p>
+              <h1>交易报告 PDF 提取与核验</h1>
+            </div>
+            <div class="topbar-actions">
+              <a id="reportDownload" class="button secondary disabled" href="#">下载 Excel</a>
+            </div>
+          </header>
+
+          <section class="input-band single" aria-label="交易报告导入">
+            <form id="reportFolderForm" class="folder-form wide">
+              <label for="reportFolderInput">服务器文件夹路径</label>
+              <div class="inline-control">
+                <input id="reportFolderInput" type="text" value="/Users/xukeqiang/Documents/Amazon_Data_Process/汇总报告下载（202604-202605）" />
+                <button class="button accent" type="submit">提取并生成 Excel</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="report-metrics" aria-label="交易报告概览">
+            <div class="metric compact">
+              <span>PDF 文件</span>
+              <strong id="reportFilesMetric">0</strong>
+            </div>
+            <div class="metric compact">
+              <span>已解析</span>
+              <strong id="reportProcessedMetric">0</strong>
+            </div>
+            <div class="metric compact">
+              <span>明细行</span>
+              <strong id="reportDetailsMetric">0</strong>
+            </div>
+            <div class="metric compact">
+              <span>需复核</span>
+              <strong id="reportWarningsMetric">0</strong>
+            </div>
+          </section>
+
+          <section class="table-panel">
+            <div class="panel-header">
+              <div>
+                <h2>提取结果</h2>
+                <p id="reportBatchLabel">尚未处理交易报告</p>
+              </div>
+              <div id="reportStatusText" class="status-text">等待导入</div>
+            </div>
+            <div class="table-wrap">
+              <table class="report-table">
+                <thead>
+                  <tr>
+                    <th>来源文件</th>
+                    <th>店铺</th>
+                    <th>站点</th>
+                    <th>报告期</th>
+                    <th>货币</th>
+                    <th>摘要/明细</th>
+                    <th>状态</th>
+                    <th>备注</th>
+                  </tr>
+                </thead>
+                <tbody id="reportResultBody">
+                  <tr>
+                    <td class="empty" colspan="8">处理一批交易报告 PDF 后，结果会显示在这里。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="historyView" class="view-panel hidden" data-view-panel="history">
+          <header class="topbar">
+            <div>
+              <p class="kicker">TASK HISTORY</p>
+              <h1>历史任务</h1>
+            </div>
+            <div class="topbar-actions">
+              <button id="refreshHistoryButton" class="button secondary" type="button">刷新</button>
+            </div>
+          </header>
+
+          <section class="report-metrics" aria-label="历史任务概览">
+            <div class="metric compact">
+              <span>全部任务</span>
+              <strong id="historyTotalMetric">0</strong>
+            </div>
+            <div class="metric compact">
+              <span>货件 PDF</span>
+              <strong id="historyShipmentMetric">0</strong>
+            </div>
+            <div class="metric compact">
+              <span>交易报告</span>
+              <strong id="historyReportMetric">0</strong>
+            </div>
+            <div class="metric compact">
+              <span>需复核</span>
+              <strong id="historyReviewMetric">0</strong>
+            </div>
+          </section>
+
+          <section class="table-panel">
+            <div class="panel-header">
+              <div>
+                <h2>任务记录</h2>
+                <p id="historyStatusText">记录当前服务运行期间的处理任务</p>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="history-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>任务</th>
+                    <th>创建人</th>
+                    <th>来源</th>
+                    <th>摘要</th>
+                    <th>状态</th>
+                    <th>导出</th>
+                  </tr>
+                </thead>
+                <tbody id="historyResultBody">
+                  <tr>
+                    <td class="empty" colspan="7">完成一次扫描或提取后，历史任务会显示在这里。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="settingsView" class="view-panel hidden" data-view-panel="settings">
+          <header class="topbar">
+            <div>
+              <p class="kicker">SETTINGS</p>
+              <h1>系统设置</h1>
+            </div>
+            <div class="topbar-actions">
+              <button id="refreshSettingsButton" class="button secondary" type="button">刷新</button>
+            </div>
+          </header>
+
+          <section class="settings-grid" aria-label="系统设置">
+            <div class="settings-panel">
+              <span class="section-label">SERVICE</span>
+              <h2>服务状态</h2>
+              <dl class="settings-list" id="serviceSettingsList"></dl>
+            </div>
+            <div class="settings-panel">
+              <span class="section-label">PATHS</span>
+              <h2>目录权限</h2>
+              <dl class="settings-list" id="pathSettingsList"></dl>
+            </div>
+            <div class="settings-panel">
+              <span class="section-label">PROCESSING</span>
+              <h2>处理策略</h2>
+              <div id="processingSettingsList" class="settings-stack"></div>
+            </div>
+            <div class="settings-panel">
+              <span class="section-label">DEPLOYMENT</span>
+              <h2>部署说明</h2>
+              <div id="deploymentSettingsList" class="settings-stack"></div>
+            </div>
+            <div id="userManagementPanel" class="settings-panel full-span hidden">
+              <span class="section-label">ADMIN</span>
+              <h2>用户管理</h2>
+              <form id="userForm" class="user-form">
+                <input id="newUsername" type="text" placeholder="用户名" autocomplete="off" />
+                <input id="newDisplayName" type="text" placeholder="显示名" autocomplete="off" />
+                <input id="newPassword" type="password" placeholder="初始密码" autocomplete="new-password" />
+                <select id="newRole">
+                  <option value="operator">操作员</option>
+                  <option value="admin">管理员</option>
+                </select>
+                <button class="button primary" type="submit">新增用户</button>
+              </form>
+              <p id="userStatusText" class="status-text">管理员可以新增、停用、改角色、重置密码或删除用户。</p>
+              <div class="table-wrap compact-table-wrap">
+                <table class="user-table">
+                  <thead>
+                    <tr>
+                      <th>用户</th>
+                      <th>角色</th>
+                      <th>状态</th>
+                      <th>创建时间</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="userTableBody">
+                    <tr>
+                      <td class="empty" colspan="5">加载用户中...</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </section>
+      </main>
+
+      <aside class="inspector" aria-label="批次状态">
+        <div class="inspector-section" data-inspector-panel="shipment">
+          <span class="section-label">BATCH</span>
+          <h2>批次概览</h2>
+        </div>
+        <section class="summary-grid" aria-label="批次概览" data-inspector-panel="shipment">
+          <div class="metric">
+            <span>PDF 文件</span>
+            <strong id="filesMetric">0</strong>
+          </div>
+          <div class="metric">
+            <span>箱码总数</span>
+            <strong id="boxesMetric">0</strong>
+          </div>
+          <div class="metric">
+            <span>通过</span>
+            <strong id="validMetric">0</strong>
+          </div>
+          <div class="metric">
+            <span>需复核</span>
+            <strong id="reviewMetric">0</strong>
+          </div>
+        </section>
+        <div class="inspector-section" id="exports">
+          <span class="section-label">EXPORTS</span>
+          <p>CSV / Excel</p>
+        </div>
+        <div class="inspector-section hidden" data-inspector-panel="report">
+          <span class="section-label">REPORTS</span>
+          <h2>交易报告</h2>
+          <p>生成带核验表的 Excel 工作簿</p>
+        </div>
+        <div class="inspector-section hidden" data-inspector-panel="history">
+          <span class="section-label">HISTORY</span>
+          <h2>历史任务</h2>
+          <p>当前服务运行期间的批次记录</p>
+        </div>
+        <div class="inspector-section hidden" data-inspector-panel="settings">
+          <span class="section-label">SETTINGS</span>
+          <h2>系统设置</h2>
+          <p>路径、部署与处理策略</p>
+        </div>
+      </aside>
+    </div>
+
+    <script src="/static/app.js?v=20260621-shipment-package"></script>
+  </body>
+</html>
