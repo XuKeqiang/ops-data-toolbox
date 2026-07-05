@@ -10,6 +10,7 @@ import json
 import mimetypes
 import shutil
 import uuid
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,7 +31,7 @@ from .auth import (
     verify_password,
 )
 from .config import APP_ROOT, PROJECT_ROOT, STATIC_ROOT, load_config
-from .report_pdf.batch import ReportPdfJob, process_report_folder
+from .report_pdf.batch import ReportPdfJob, preflight_report_folder, process_report_folder
 from .shipment_pdf.batch import (
     apply_renames,
     export_csv,
@@ -41,9 +42,11 @@ from .shipment_pdf.batch import (
 )
 from .shipment_pdf.models import ShipmentRecord
 from .storage import (
+    delete_task,
     get_task,
     init_db,
     list_tasks,
+    prune_tasks,
     record_export,
     record_operation,
     record_task,
@@ -75,7 +78,10 @@ BATCHES: dict[str, BatchState] = {}
 REPORT_JOBS: dict[str, ReportPdfJob] = {}
 TRANSACTION_JOBS: dict[str, TransactionCsvJob] = {}
 SESSIONS: dict[str, str] = {}
+REPORT_PREFLIGHTS: dict[str, Path] = {}
 SHIPMENT_PACKAGES: dict[str, list[dict]] = {}
+SHIPMENT_PACKAGE_BUNDLES: dict[str, dict] = {}
+SHIPMENT_SELECTED_PACKAGES: dict[str, list[dict]] = {}
 
 
 class AmazonToolboxHandler(BaseHTTPRequestHandler):
@@ -105,6 +111,10 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
             self._handle_transaction_download(parse_qs(parsed.query))
         elif parsed.path == "/api/shipment-package/download":
             self._handle_shipment_package_download(parse_qs(parsed.query))
+        elif parsed.path == "/api/shipment-package/download-all":
+            self._handle_shipment_package_download_all(parse_qs(parsed.query))
+        elif parsed.path == "/api/shipment-selection/download":
+            self._handle_shipment_selection_download(parse_qs(parsed.query))
         else:
             self._send_json({"error": "Not found"}, status=404)
 
@@ -118,8 +128,16 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
             self._handle_logout()
         elif parsed.path == "/api/users":
             self._handle_create_user()
+        elif parsed.path == "/api/report-pdf/preflight-folder":
+            self._handle_report_preflight_folder()
+        elif parsed.path == "/api/report-pdf/preflight-upload":
+            self._handle_report_preflight_upload()
+        elif parsed.path == "/api/report-pdf/process-preflight-upload":
+            self._handle_report_process_preflight_upload()
         elif parsed.path == "/api/report-pdf/process-folder":
             self._handle_report_process_folder()
+        elif parsed.path == "/api/report-pdf/upload":
+            self._handle_report_upload()
         elif parsed.path == "/api/transaction-csv/process-folder":
             self._handle_transaction_process_folder()
         elif parsed.path == "/api/upload":
@@ -128,6 +146,12 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
             self._handle_rename()
         elif parsed.path == "/api/package-by-factory":
             self._handle_package_by_factory()
+        elif parsed.path == "/api/shipment-selection/package":
+            self._handle_shipment_selection_package()
+        elif parsed.path == "/api/history/cleanup":
+            self._handle_history_cleanup()
+        elif parsed.path == "/api/history/batch-delete":
+            self._handle_history_batch_delete()
         else:
             self._send_json({"error": "Not found"}, status=404)
 
@@ -142,6 +166,8 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/users/"):
             self._handle_delete_user(parsed.path.removeprefix("/api/users/"))
+        elif parsed.path.startswith("/api/history/"):
+            self._handle_history_delete(parsed.path.removeprefix("/api/history/"))
         else:
             self._send_json({"error": "Not found"}, status=404)
 
@@ -198,6 +224,81 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         if not user:
             return
         self._send_json(_history_payload(user))
+
+    def _handle_history_delete(self, task_id: str) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        task = get_task(DATABASE_PATH, task_id)
+        if not task:
+            self._send_json({"error": "历史任务不存在"}, status=404)
+            return
+        if not _can_access_owner(user, task.get("owner_id", "")):
+            self._send_json({"error": "没有权限删除该历史任务"}, status=403)
+            return
+        removed_files = _remove_task_artifacts(task)
+        deleted = delete_task(DATABASE_PATH, task_id)
+        record_operation(
+            DATABASE_PATH,
+            operation="history_delete",
+            owner=user,
+            target_id=task_id,
+            target_type=task.get("type", ""),
+            message=f"删除历史任务：{task.get('title', task_id)}",
+            payload={"deleted": deleted, "removed_files": removed_files},
+        )
+        self._send_json({"deleted": deleted, "removed_files": removed_files})
+
+    def _handle_history_cleanup(self) -> None:
+        user = self._require_admin()
+        if not user:
+            return
+        payload = self._read_json()
+        days = int(payload.get("days", 30) or 30)
+        if days < 1:
+            self._send_json({"error": "保留天数至少为 1 天"}, status=400)
+            return
+        tasks = prune_tasks(DATABASE_PATH, user, days)
+        removed_files = sum(_remove_task_artifacts(task) for task in tasks)
+        record_operation(
+            DATABASE_PATH,
+            operation="history_cleanup",
+            owner=user,
+            target_type="history",
+            message=f"清理 {days} 天前历史任务",
+            payload={"days": days, "deleted": len(tasks), "removed_files": removed_files},
+        )
+        self._send_json({"deleted": len(tasks), "removed_files": removed_files, "days": days})
+
+    def _handle_history_batch_delete(self) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        payload = self._read_json()
+        task_ids = [str(item) for item in payload.get("task_ids", []) if str(item)]
+        if not task_ids:
+            self._send_json({"error": "请选择要删除的历史任务"}, status=400)
+            return
+        deleted = 0
+        removed_files = 0
+        skipped: list[str] = []
+        for task_id in task_ids:
+            task = get_task(DATABASE_PATH, task_id)
+            if not task or not _can_access_owner(user, task.get("owner_id", "")):
+                skipped.append(task_id)
+                continue
+            removed_files += _remove_task_artifacts(task)
+            if delete_task(DATABASE_PATH, task_id):
+                deleted += 1
+        record_operation(
+            DATABASE_PATH,
+            operation="history_batch_delete",
+            owner=user,
+            target_type="history",
+            message=f"批量删除历史任务：{deleted} 条",
+            payload={"requested": len(task_ids), "deleted": deleted, "skipped": skipped, "removed_files": removed_files},
+        )
+        self._send_json({"deleted": deleted, "skipped": skipped, "removed_files": removed_files})
 
     def _handle_settings(self) -> None:
         user = self._require_auth()
@@ -369,6 +470,59 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         ]
         self._send_json(_batch_payload(batch, logs=logs))
 
+    def _handle_report_preflight_folder(self) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        payload = self._read_json()
+        folder_text = str(payload.get("folder", "")).strip()
+        if not folder_text:
+            self._send_json({"error": "请提供服务器上的汇总报告 PDF 文件夹路径"}, status=400)
+            return
+        folder = _resolve_allowed_folder(folder_text)
+        if folder is None:
+            self._send_json({"error": f"为了安全，当前只允许扫描这些目录：{_allowed_roots_label()}"}, status=400)
+            return
+        if not folder.exists() or not folder.is_dir():
+            self._send_json({"error": "文件夹不存在或不是有效目录"}, status=400)
+            return
+        preflight = preflight_report_folder(folder)
+        self._send_json({"source_label": str(folder), **preflight})
+
+    def _handle_report_preflight_upload(self) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        saved = self._save_report_upload_for_preflight()
+        if "error" in saved:
+            self._send_json(saved, status=saved.get("status", 400))
+            return
+        upload_dir = Path(saved["upload_dir"])
+        preflight = preflight_report_folder(upload_dir)
+        REPORT_PREFLIGHTS[saved["preflight_id"]] = upload_dir
+        self._send_json({
+            "preflight_id": saved["preflight_id"],
+            "source_label": f"上传预检 {saved['preflight_id']}",
+            "received": saved["received"],
+            "saved": saved["saved"],
+            "skipped": saved["skipped"],
+            "skipped_paths": saved["skipped_paths"],
+            "renamed": saved["renamed"],
+            **preflight,
+        })
+
+    def _handle_report_process_preflight_upload(self) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        payload = self._read_json()
+        preflight_id = str(payload.get("preflight_id", "")).strip()
+        upload_dir = REPORT_PREFLIGHTS.pop(preflight_id, None)
+        if not upload_dir or not upload_dir.exists():
+            self._send_json({"error": "预检批次不存在或已处理，请重新上传"}, status=404)
+            return
+        self._process_report_folder_for_user(upload_dir, user, source_label=f"上传批次 {preflight_id}", job_id=preflight_id)
+
     def _handle_report_process_folder(self) -> None:
         user = self._require_auth()
         if not user:
@@ -376,7 +530,7 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         payload = self._read_json()
         folder_text = str(payload.get("folder", "")).strip()
         if not folder_text:
-            self._send_json({"error": "请提供服务器上的交易报告 PDF 文件夹路径"}, status=400)
+            self._send_json({"error": "请提供服务器上的汇总报告 PDF 文件夹路径"}, status=400)
             return
 
         folder = _resolve_allowed_folder(folder_text)
@@ -387,15 +541,20 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "文件夹不存在或不是有效目录"}, status=400)
             return
 
-        job_id = _new_batch_id()
+        self._process_report_folder_for_user(folder, user)
+
+    def _process_report_folder_for_user(self, folder: Path, user: dict, source_label: str | None = None, job_id: str | None = None) -> None:
+        job_id = job_id or _new_batch_id()
         OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
         output_path = OUTPUT_ROOT / f"{job_id}-amazon-report-pdf-results.xlsx"
         job = process_report_folder(folder, output_path, job_id)
+        if source_label:
+            job.source_label = source_label
         REPORT_JOBS[job.job_id] = job
         _record_history(
             task_id=job.job_id,
             task_type="report_pdf",
-            title="交易报告 PDF",
+            title="汇总报告 PDF",
             source_label=job.source_label,
             summary=job.summary,
             status="需复核" if job.summary.get("warnings") else "完成",
@@ -408,8 +567,168 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
             owner=user,
             target_id=job.job_id,
             target_type="report_pdf",
-            message=f"处理交易报告 PDF 文件夹：{folder}",
+            message=f"处理汇总报告 PDF 文件夹：{folder}",
             payload=job.summary,
+        )
+        self._send_json(_report_job_payload(job))
+
+    def _save_report_upload_for_preflight(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        if content_length > CONFIG.max_upload_bytes:
+            return {"error": f"上传内容超过限制：当前上限 {CONFIG.max_upload_mb} MB", "status": 413}
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            return {"error": "请上传 multipart/form-data 文件", "status": 400}
+
+        preflight_id = _new_batch_id()
+        upload_dir = UPLOAD_ROOT / f"{preflight_id}-report-pdf"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": content_type,
+                "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+            },
+        )
+        received = saved = skipped = renamed = 0
+        skipped_paths: list[str] = []
+        files = form["files"] if "files" in form else []
+        if not isinstance(files, list):
+            files = [files]
+        for item in files:
+            received += 1
+            raw_filename = getattr(item, "filename", "")
+            upload_path = _safe_upload_relative_path(raw_filename)
+            if upload_path is None or upload_path.suffix.lower() != ".pdf":
+                skipped += 1
+                skipped_paths.append(_upload_display_path(raw_filename))
+                continue
+            target = _unique_upload_target(upload_dir / upload_path)
+            if target.name != upload_path.name or target.parent != upload_dir / upload_path.parent:
+                renamed += 1
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as handle:
+                shutil.copyfileobj(item.file, handle)
+            saved += 1
+        if saved == 0:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            return {
+                "error": "没有收到 PDF 文件",
+                "status": 400,
+                "received": received,
+                "skipped": skipped,
+                "skipped_paths": skipped_paths,
+            }
+        return {
+            "preflight_id": preflight_id,
+            "upload_dir": str(upload_dir),
+            "received": received,
+            "saved": saved,
+            "skipped": skipped,
+            "skipped_paths": skipped_paths,
+            "renamed": renamed,
+        }
+
+    def _handle_report_upload(self) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        if content_length > CONFIG.max_upload_bytes:
+            self._send_json(
+                {"error": f"上传内容超过限制：当前上限 {CONFIG.max_upload_mb} MB"},
+                status=413,
+            )
+            return
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self._send_json({"error": "请上传 multipart/form-data 文件"}, status=400)
+            return
+
+        job_id = _new_batch_id()
+        upload_dir = UPLOAD_ROOT / f"{job_id}-report-pdf"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": content_type,
+                "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+            },
+        )
+
+        received = 0
+        saved = 0
+        skipped = 0
+        skipped_paths: list[str] = []
+        renamed = 0
+        files = form["files"] if "files" in form else []
+        if not isinstance(files, list):
+            files = [files]
+        for item in files:
+            received += 1
+            raw_filename = getattr(item, "filename", "")
+            upload_path = _safe_upload_relative_path(raw_filename)
+            if upload_path is None:
+                skipped += 1
+                skipped_paths.append(_upload_display_path(raw_filename))
+                continue
+            if upload_path.suffix.lower() != ".pdf":
+                skipped += 1
+                skipped_paths.append(_upload_display_path(raw_filename))
+                continue
+            target = _unique_upload_target(upload_dir / upload_path)
+            if target.name != upload_path.name or target.parent != upload_dir / upload_path.parent:
+                renamed += 1
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as handle:
+                shutil.copyfileobj(item.file, handle)
+            saved += 1
+
+        if saved == 0:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            self._send_json({
+                "error": "没有收到 PDF 文件",
+                "received": received,
+                "skipped": skipped,
+                "skipped_paths": skipped_paths,
+            }, status=400)
+            return
+
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        output_path = OUTPUT_ROOT / f"{job_id}-amazon-report-pdf-results.xlsx"
+        job = process_report_folder(upload_dir, output_path, job_id)
+        job.source_label = f"上传批次 {job_id}"
+        REPORT_JOBS[job.job_id] = job
+        _record_history(
+            task_id=job.job_id,
+            task_type="report_pdf",
+            title="汇总报告 PDF",
+            source_label=f"上传批次 {job_id}",
+            summary={
+                **job.summary,
+                "received": received,
+                "saved": saved,
+                "skipped": skipped,
+                "skipped_paths": skipped_paths,
+                "renamed": renamed,
+            },
+            status="需复核" if job.summary.get("warnings") else "完成",
+            downloads=[{"label": "Excel 工作簿", "url": f"/api/report-pdf/download?job_id={job.job_id}"}],
+            owner=user,
+        )
+        record_operation(
+            DATABASE_PATH,
+            operation="report_pdf_upload",
+            owner=user,
+            target_id=job.job_id,
+            target_type="report_pdf",
+            message=f"上传并处理汇总报告 PDF：{job_id}",
+            payload={"received": received, "saved": saved, "skipped": skipped, "skipped_paths": skipped_paths, **job.summary},
         )
         self._send_json(_report_job_payload(job))
 
@@ -505,18 +824,22 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         received = 0
         saved = 0
         skipped = 0
+        skipped_paths: list[str] = []
         renamed = 0
         files = form["files"] if "files" in form else []
         if not isinstance(files, list):
             files = [files]
         for item in files:
             received += 1
-            upload_path = _safe_upload_relative_path(getattr(item, "filename", ""))
+            raw_filename = getattr(item, "filename", "")
+            upload_path = _safe_upload_relative_path(raw_filename)
             if upload_path is None:
                 skipped += 1
+                skipped_paths.append(_upload_display_path(raw_filename))
                 continue
             if upload_path.suffix.lower() != ".pdf":
                 skipped += 1
+                skipped_paths.append(_upload_display_path(raw_filename))
                 continue
             target = _unique_upload_target(upload_dir / upload_path)
             if target.name != upload_path.name or target.parent != upload_dir / upload_path.parent:
@@ -533,6 +856,7 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
                 "logs": [
                     {"level": "info", "message": f"收到 {received} 个上传文件"},
                     {"level": "warning", "message": f"跳过 {skipped} 个非 PDF 或无效文件"},
+                    *_skipped_path_logs(skipped_paths),
                 ],
             }, status=400)
             return
@@ -546,7 +870,7 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
             target_id=batch.batch_id,
             target_type="shipment_pdf",
             message=f"上传并扫描货件 PDF：{batch_id}",
-            payload={"received": received, "saved": saved, "skipped": skipped, "records": len(records)},
+            payload={"received": received, "saved": saved, "skipped": skipped, "skipped_paths": skipped_paths, "records": len(records)},
         )
         logs = [
             {"level": "info", "message": f"收到 {received} 个上传文件"},
@@ -554,6 +878,7 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         ]
         if skipped:
             logs.append({"level": "warning", "message": f"跳过 {skipped} 个非 PDF 或无效文件"})
+            logs.extend(_skipped_path_logs(skipped_paths))
         if renamed:
             logs.append({"level": "warning", "message": f"发现 {renamed} 个重名 PDF，已自动加序号保存"})
         logs.append({"level": "success", "message": f"扫描完成：识别到 {len(records)} 个 PDF"})
@@ -567,7 +892,27 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         export_format = _first_query(query, "format") or "csv"
         batch = BATCHES.get(batch_id)
         if not batch:
-            self._send_json({"error": "批次不存在或服务已重启"}, status=404)
+            history_item = get_task(DATABASE_PATH, batch_id)
+            if not history_item:
+                self._send_json({"error": "批次不存在或服务已重启"}, status=404)
+                return
+            if not _can_access_owner(user, history_item.get("owner_id", "")):
+                self._send_json({"error": "没有权限导出该批次"}, status=403)
+                return
+            suffix = "xlsx" if export_format == "xlsx" else "csv"
+            output_path = OUTPUT_ROOT / f"{batch_id}-shipment-results.{suffix}"
+            if not output_path.is_file():
+                self._send_json({"error": "历史导出文件不存在，请重新处理该批次"}, status=404)
+                return
+            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if suffix == "xlsx" else "text/csv; charset=utf-8"
+            record_export(
+                DATABASE_PATH,
+                task_id=batch_id,
+                export_type=f"shipment_{export_format}",
+                file_path=output_path,
+                owner=user,
+            )
+            self._send_download(output_path, content_type)
             return
         if not _can_access_owner(user, batch.owner_id):
             self._send_json({"error": "没有权限导出该批次"}, status=403)
@@ -661,16 +1006,20 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         filename = Path(_first_query(query, "filename")).name
         batch = BATCHES.get(batch_id)
         if not batch:
-            self._send_json({"error": "批次不存在或服务已重启"}, status=404)
-            return
-        if not _can_access_owner(user, batch.owner_id):
+            history_item = get_task(DATABASE_PATH, batch_id)
+            if not history_item:
+                self._send_json({"error": "批次不存在或服务已重启"}, status=404)
+                return
+            if not _can_access_owner(user, history_item.get("owner_id", "")):
+                self._send_json({"error": "没有权限下载该批次"}, status=403)
+                return
+            zip_path = OUTPUT_ROOT / f"{batch_id}-factory-packages" / filename
+        elif not _can_access_owner(user, batch.owner_id):
             self._send_json({"error": "没有权限下载该批次"}, status=403)
             return
-        package = next((item for item in SHIPMENT_PACKAGES.get(batch_id, []) if item.get("zip_filename") == filename), None)
-        if not package:
-            self._send_json({"error": "打包文件不存在"}, status=404)
-            return
-        zip_path = Path(package["zip_path"])
+        else:
+            package = next((item for item in SHIPMENT_PACKAGES.get(batch_id, []) if item.get("zip_filename") == filename), None)
+            zip_path = Path(package["zip_path"]) if package else OUTPUT_ROOT / f"{batch_id}-factory-packages" / filename
         if not zip_path.is_file():
             self._send_json({"error": "打包文件已被移动或删除"}, status=404)
             return
@@ -678,6 +1027,69 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
             DATABASE_PATH,
             task_id=batch_id,
             export_type="shipment_factory_zip",
+            file_path=zip_path,
+            owner=user,
+        )
+        self._send_download(zip_path, "application/zip")
+
+    def _handle_shipment_package_download_all(self, query: dict[str, list[str]]) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        batch_id = _first_query(query, "batch_id")
+        batch = BATCHES.get(batch_id)
+        if not batch:
+            history_item = get_task(DATABASE_PATH, batch_id)
+            if not history_item:
+                self._send_json({"error": "批次不存在或服务已重启"}, status=404)
+                return
+            if not _can_access_owner(user, history_item.get("owner_id", "")):
+                self._send_json({"error": "没有权限下载该批次"}, status=403)
+                return
+            zip_path = OUTPUT_ROOT / f"{batch_id}-factory-packages" / f"全部工厂-{batch_id}.zip"
+        elif not _can_access_owner(user, batch.owner_id):
+            self._send_json({"error": "没有权限下载该批次"}, status=403)
+            return
+        else:
+            bundle = SHIPMENT_PACKAGE_BUNDLES.get(batch_id)
+            zip_path = Path(bundle["zip_path"]) if bundle else OUTPUT_ROOT / f"{batch_id}-factory-packages" / f"全部工厂-{batch_id}.zip"
+        if not zip_path.is_file():
+            self._send_json({"error": "批量下载文件已被移动或删除"}, status=404)
+            return
+        record_export(
+            DATABASE_PATH,
+            task_id=batch_id,
+            export_type="shipment_factory_zip_all",
+            file_path=zip_path,
+            owner=user,
+        )
+        self._send_download(zip_path, "application/zip")
+
+    def _handle_shipment_selection_download(self, query: dict[str, list[str]]) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        batch_id = _first_query(query, "batch_id")
+        filename = Path(_first_query(query, "filename")).name
+        batch = BATCHES.get(batch_id)
+        if not batch:
+            self._send_json({"error": "批次不存在或服务已重启"}, status=404)
+            return
+        if not _can_access_owner(user, batch.owner_id):
+            self._send_json({"error": "没有权限下载该批次"}, status=403)
+            return
+        package = next((item for item in SHIPMENT_SELECTED_PACKAGES.get(batch_id, []) if item.get("zip_filename") == filename), None)
+        if not package:
+            self._send_json({"error": "选中文件压缩包不存在"}, status=404)
+            return
+        zip_path = Path(package["zip_path"])
+        if not zip_path.is_file():
+            self._send_json({"error": "选中文件压缩包已被移动或删除"}, status=404)
+            return
+        record_export(
+            DATABASE_PATH,
+            task_id=batch_id,
+            export_type="shipment_selected_pdf_zip",
             file_path=zip_path,
             owner=user,
         )
@@ -750,9 +1162,12 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
             for package in result["packages"]
         ]
         SHIPMENT_PACKAGES[batch.batch_id] = packages
+        bundle = _build_shipment_package_bundle(batch.batch_id, packages, result["package_root"])
+        SHIPMENT_PACKAGE_BUNDLES[batch.batch_id] = bundle
+        all_download = [{"label": "全部工厂压缩包", "url": bundle["download_url"]}] if bundle else []
         _update_history_downloads(
             batch.batch_id,
-            [{"label": f"{item['factory_name']} 压缩包", "url": item["download_url"]} for item in packages],
+            all_download + [{"label": f"{item['factory_name']} 压缩包", "url": item["download_url"]} for item in packages],
         )
         record_operation(
             DATABASE_PATH,
@@ -768,9 +1183,59 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
                 "batch_id": batch.batch_id,
                 "package_root": result["package_root"],
                 "packages": packages,
+                "bundle": bundle,
                 "skipped": result["skipped"],
             }
         )
+
+    def _handle_shipment_selection_package(self) -> None:
+        user = self._require_auth()
+        if not user:
+            return
+        payload = self._read_json()
+        batch_id = str(payload.get("batch_id", ""))
+        selected_paths = {str(path) for path in payload.get("source_paths", [])}
+        batch = BATCHES.get(batch_id)
+        if not batch:
+            self._send_json({"error": "批次不存在或服务已重启"}, status=404)
+            return
+        if not _can_access_owner(user, batch.owner_id):
+            self._send_json({"error": "没有权限打包该批次"}, status=403)
+            return
+        selected_records = [record for record in batch.records if str(record.source_path) in selected_paths]
+        if not selected_records:
+            self._send_json({"error": "请先勾选要下载的 PDF"}, status=400)
+            return
+
+        package_root = OUTPUT_ROOT / f"{batch.batch_id}-selected-packages"
+        package_root.mkdir(parents=True, exist_ok=True)
+        zip_filename = f"选中PDF-{batch.batch_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
+        zip_path = package_root / zip_filename
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for record in selected_records:
+                if record.source_path.is_file():
+                    archive.write(record.source_path, arcname=record.original_filename)
+        package = {
+            "zip_filename": zip_filename,
+            "zip_path": str(zip_path),
+            "download_url": (
+                f"/api/shipment-selection/download?batch_id={batch.batch_id}"
+                f"&filename={quote(zip_filename)}"
+            ),
+            "file_count": len(selected_records),
+            "package_root": str(package_root),
+        }
+        SHIPMENT_SELECTED_PACKAGES.setdefault(batch.batch_id, []).append(package)
+        record_operation(
+            DATABASE_PATH,
+            operation="shipment_selected_package",
+            owner=user,
+            target_id=batch.batch_id,
+            target_type="shipment_pdf",
+            message="打包下载选中的货件 PDF",
+            payload={"files": len(selected_records)},
+        )
+        self._send_json({"batch_id": batch.batch_id, "package": package})
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -868,6 +1333,11 @@ def _store_batch(
     BATCHES[batch_id] = batch
     valid_count = sum(1 for record in records if record.is_valid)
     needs_review = len(records) - valid_count
+    label_pages = sum(record.box_count for record in records)
+    unique_carton_codes = len({code for record in records for code in record.carton_codes})
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    export_csv(records, OUTPUT_ROOT / f"{batch_id}-shipment-results.csv")
+    export_xlsx(records, OUTPUT_ROOT / f"{batch_id}-shipment-results.xlsx")
     _record_history(
         task_id=batch_id,
         task_type="shipment_pdf",
@@ -875,7 +1345,9 @@ def _store_batch(
         source_label=source_label,
         summary={
             "files": len(records),
-            "boxes": sum(record.box_count for record in records),
+            "boxes": label_pages,
+            "label_pages": label_pages,
+            "unique_carton_codes": unique_carton_codes,
             "valid": valid_count,
             "needs_review": needs_review,
         },
@@ -892,12 +1364,16 @@ def _store_batch(
 def _batch_payload(batch: BatchState, logs: list[dict] | None = None) -> dict:
     plans = plan_renames(batch.records)
     valid_count = sum(1 for record in batch.records if record.is_valid)
+    label_pages = sum(record.box_count for record in batch.records)
+    unique_carton_codes = len({code for record in batch.records for code in record.carton_codes})
     payload = {
         "batch_id": batch.batch_id,
         "source_label": batch.source_label,
         "summary": {
             "files": len(batch.records),
-            "boxes": sum(record.box_count for record in batch.records),
+            "boxes": label_pages,
+            "label_pages": label_pages,
+            "unique_carton_codes": unique_carton_codes,
             "valid": valid_count,
             "needs_review": len(batch.records) - valid_count,
         },
@@ -921,6 +1397,7 @@ def _report_job_payload(job: ReportPdfJob) -> dict:
         "source_label": job.source_label,
         "summary": job.summary,
         "rows": job.rows,
+        "skipped_paths": job.summary.get("skipped_paths", []),
         "download_url": f"/api/report-pdf/download?job_id={job.job_id}",
     }
 
@@ -938,7 +1415,7 @@ def _transaction_job_payload(job: TransactionCsvJob) -> dict:
 
 
 def _history_payload(user: dict) -> dict:
-    tasks = list_tasks(DATABASE_PATH, user)
+    tasks = [_task_with_available_downloads(task) for task in list_tasks(DATABASE_PATH, user)]
     return {
         "tasks": tasks,
         "summary": {
@@ -949,6 +1426,52 @@ def _history_payload(user: dict) -> dict:
             "needs_review": sum(1 for task in tasks if task["status"] == "需复核"),
         },
     }
+
+
+def _task_with_available_downloads(task: dict) -> dict:
+    if task.get("type") != "shipment_pdf":
+        return task
+
+    task = dict(task)
+    downloads = list(task.get("downloads", []))
+    existing_urls = {item.get("url") for item in downloads}
+    task_id = task.get("id", "")
+
+    candidates = [
+        ("CSV 文件", f"/api/export?batch_id={task_id}&format=csv", OUTPUT_ROOT / f"{task_id}-shipment-results.csv"),
+        ("Excel 工作簿", f"/api/export?batch_id={task_id}&format=xlsx", OUTPUT_ROOT / f"{task_id}-shipment-results.xlsx"),
+    ]
+    for label, url, path in candidates:
+        if path.is_file() and url not in existing_urls:
+            downloads.append({"label": label, "url": url})
+            existing_urls.add(url)
+
+    package_root = OUTPUT_ROOT / f"{task_id}-factory-packages"
+    if package_root.is_dir():
+        package_paths = sorted(
+            path for path in package_root.glob("*.zip")
+            if path.is_file() and not path.name.startswith("全部工厂-")
+        )
+        bundle_path = package_root / f"全部工厂-{task_id}.zip"
+        if package_paths and not bundle_path.is_file():
+            _build_shipment_package_bundle(
+                task_id,
+                [{"zip_filename": path.name, "zip_path": str(path)} for path in package_paths],
+                str(package_root),
+            )
+        all_url = f"/api/shipment-package/download-all?batch_id={task_id}"
+        if bundle_path.is_file() and all_url not in existing_urls:
+            downloads.append({"label": "全部工厂压缩包", "url": all_url})
+            existing_urls.add(all_url)
+        for path in package_paths:
+            url = f"/api/shipment-package/download?batch_id={task_id}&filename={quote(path.name)}"
+            if url not in existing_urls:
+                factory_name = path.name.removesuffix(".zip").removesuffix(f"-{task_id}")
+                downloads.append({"label": f"{factory_name} 压缩包", "url": url})
+                existing_urls.add(url)
+
+    task["downloads"] = downloads
+    return task
 
 
 def _settings_payload(server_address: tuple[str, int], user: dict) -> dict:
@@ -979,7 +1502,7 @@ def _settings_payload(server_address: tuple[str, int], user: dict) -> dict:
         },
         "processing": [
             {"name": "货件 PDF", "engine": "pdfplumber / pypdf 规则提取", "llm": "不依赖"},
-            {"name": "交易报告 PDF", "engine": "pdfplumber 表格结构解析 + 对账校验", "llm": "不依赖"},
+            {"name": "汇总报告 PDF", "engine": "pdfplumber 表格结构解析 + 对账校验", "llm": "不依赖"},
             {"name": "交易明细 CSV/XLSX", "engine": "openpyxl / csv 规则清洗、字段翻译、记录类型分类", "llm": "不依赖"},
         ],
         "exports": ["CSV", "Excel"],
@@ -1044,6 +1567,20 @@ def _safe_upload_relative_path(raw_filename: str) -> Path | None:
     return Path(*parts)
 
 
+def _upload_display_path(raw_filename: str) -> str:
+    cleaned = raw_filename.replace("\\", "/").strip()
+    return cleaned[:240] if cleaned else "未命名文件"
+
+
+def _skipped_path_logs(paths: list[str], limit: int = 20) -> list[dict]:
+    if not paths:
+        return []
+    logs = [{"level": "warning", "message": f"已跳过：{path}"} for path in paths[:limit]]
+    if len(paths) > limit:
+        logs.append({"level": "warning", "message": f"还有 {len(paths) - limit} 个已跳过文件未在日志中展开"})
+    return logs
+
+
 def _sanitize_upload_part(value: str) -> str:
     cleaned = value.strip().replace("\x00", "")
     for char in '<>:"|?*':
@@ -1101,6 +1638,69 @@ def _first_query(query: dict[str, list[str]], key: str) -> str:
 def _ascii_download_filename(filename: str) -> str:
     cleaned = "".join(char if 32 <= ord(char) < 127 and char not in {'"', "\\"} else "_" for char in filename)
     return cleaned or "download"
+
+
+def _build_shipment_package_bundle(batch_id: str, packages: list[dict], package_root: str) -> dict:
+    if not packages:
+        return {}
+    bundle_filename = f"全部工厂-{batch_id}.zip"
+    bundle_path = Path(package_root) / bundle_filename
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for package in packages:
+            package_path = Path(package["zip_path"])
+            if package_path.is_file():
+                archive.write(package_path, arcname=package["zip_filename"])
+    return {
+        "zip_filename": bundle_filename,
+        "zip_path": str(bundle_path),
+        "download_url": f"/api/shipment-package/download-all?batch_id={batch_id}",
+        "package_count": len(packages),
+    }
+
+
+def _remove_task_artifacts(task: dict) -> int:
+    task_id = task.get("id", "")
+    if not task_id:
+        return 0
+    candidates: list[Path] = []
+    task_type = task.get("type")
+    if task_type == "shipment_pdf":
+        candidates.extend([
+            OUTPUT_ROOT / f"{task_id}-shipment-results.csv",
+            OUTPUT_ROOT / f"{task_id}-shipment-results.xlsx",
+            OUTPUT_ROOT / f"{task_id}-factory-packages",
+            OUTPUT_ROOT / f"{task_id}-selected-pdfs.zip",
+            UPLOAD_ROOT / task_id,
+        ])
+    elif task_type == "report_pdf":
+        candidates.extend([
+            OUTPUT_ROOT / f"{task_id}-amazon-report-pdf-results.xlsx",
+            UPLOAD_ROOT / f"{task_id}-report-pdf",
+        ])
+    elif task_type == "transaction_csv":
+        candidates.append(OUTPUT_ROOT / f"{task_id}-transaction-csv")
+
+    removed = 0
+    for path in candidates:
+        removed += _safe_remove_generated_path(path)
+    return removed
+
+
+def _safe_remove_generated_path(path: Path) -> int:
+    try:
+        resolved = path.resolve()
+        allowed_roots = [OUTPUT_ROOT.resolve(), UPLOAD_ROOT.resolve()]
+        if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+            return 0
+        if resolved.is_dir():
+            shutil.rmtree(resolved)
+            return 1
+        if resolved.is_file():
+            resolved.unlink()
+            return 1
+    except FileNotFoundError:
+        return 0
+    return 0
 
 
 def run(host: str | None = None, port: int | None = None) -> None:

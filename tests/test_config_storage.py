@@ -7,9 +7,11 @@ from pathlib import Path
 
 from app.amazon_toolbox.config import load_config
 from app.amazon_toolbox.storage import (
+    delete_task,
     get_task,
     init_db,
     list_tasks,
+    prune_tasks,
     record_export,
     record_operation,
     record_task,
@@ -102,6 +104,45 @@ class ConfigStorageTests(unittest.TestCase):
             self.assertEqual(task["summary"]["files"], 2)
             self.assertEqual(len(task["downloads"]), 2)
             self.assertEqual(list_tasks(db_path, owner)[0]["id"], "task1")
+
+            self.assertTrue(delete_task(db_path, "task1"))
+            self.assertIsNone(get_task(db_path, "task1"))
+
+    def test_storage_prunes_old_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "app.sqlite3"
+            owner = {
+                "id": "u1",
+                "username": "admin",
+                "display_name": "Admin",
+                "role": "admin",
+            }
+            for task_id, created_at in [
+                ("old-task", "2020-01-01 10:00:00"),
+                ("new-task", "2099-01-01 10:00:00"),
+            ]:
+                record_task(
+                    db_path,
+                    {
+                        "id": task_id,
+                        "type": "report_pdf",
+                        "title": "汇总报告 PDF",
+                        "source_label": "sample",
+                        "created_at": created_at,
+                        "summary": {"files": 1},
+                        "status": "完成",
+                        "downloads": [],
+                        "owner_id": owner["id"],
+                        "owner_name": owner["display_name"],
+                        "owner_username": owner["username"],
+                    },
+                )
+
+            pruned = prune_tasks(db_path, owner, days=30)
+
+            self.assertEqual([task["id"] for task in pruned], ["old-task"])
+            self.assertIsNone(get_task(db_path, "old-task"))
+            self.assertIsNotNone(get_task(db_path, "new-task"))
 
 
 if __name__ == "__main__":

@@ -660,7 +660,53 @@ def normalize_en(f):
 
 def get_cn(f):
     en = normalize_en(f)
-    return FIELD_CN.get(en, en)
+    return FIELD_CN.get(en, "未映射字段")
+
+
+def infer_pdf_country_code(currency, period_text=""):
+    currency_map = {
+        "AUD": "AU",
+        "CAD": "CA",
+        "GBP": "UK",
+        "JPY": "JP",
+        "MXN": "MX",
+        "SEK": "SE",
+        "PLN": "PL",
+        "SAR": "SA",
+        "AED": "AE",
+        "USD": "US",
+    }
+    if currency in currency_map:
+        return currency_map[currency]
+    if "GMT+10" in period_text:
+        return "AU"
+    if "GMT+4" in period_text:
+        return "AE"
+    return ""
+
+
+def extract_names_from_positioned_words(all_words):
+    names = {"display_name": "", "legal_name": ""}
+    for _top, row_words in group_col_rows(all_words, tol=3.0):
+        row_words = sorted(row_words, key=lambda w: w["x0"])
+        row_text = " ".join(w["text"] for w in row_words)
+        lowered = row_text.lower()
+        for key, labels in {
+            "display_name": ("display name", "anzeigename", "visningsnamn", "weergavenaam", "nombre para mostrar", "nome visualizzato"),
+            "legal_name": ("legal name", "eingetragener firmenname", "juridiskt", "wettelijke", "razón social", "nome legale"),
+        }.items():
+            if names[key] or not any(label in lowered for label in labels):
+                continue
+            label_end_x = max((w["x0"] for w in row_words if w["text"].rstrip(":").lower() in {"display", "name", "legal", "anzeigename", "visningsnamn", "weergavenaam", "nombre", "para", "mostrar", "nome", "visualizzato", "eingetragener", "firmenname", "juridiskt", "wettelijke", "razón", "social", "legale"}), default=0)
+            value_words = [
+                w["text"].strip()
+                for w in row_words
+                if w["x0"] > label_end_x + 18 and w["text"].strip() and not w["text"].strip().endswith(":")
+            ]
+            value = " ".join(value_words).strip()
+            if value:
+                names[key] = value
+    return names
 
 def parse_num(s):
     if not s: return None
@@ -991,6 +1037,9 @@ MONTH_ABBR_TO_NUM = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,
 def extract_pdf(pdf_path, store, country, country_code=None):
     meta = {"store":store,"country":country,"country_code":country_code or country,
             "source_file":os.path.basename(pdf_path),"source_path":str(pdf_path),
+            "filename_store": store, "filename_country": country, "filename_country_code": country_code or country,
+            "store_source": "filename_or_path", "country_source": "filename_or_path",
+            "pdf_country_code": "", "store_audit_status": "", "country_audit_status": "",
             "currency":"","period":"",
             "year":None,"month":None,"quarter":None,
             "filename_year":None,"filename_month":None,"filename_quarter":None,
@@ -1088,15 +1137,33 @@ def extract_pdf(pdf_path, store, country, country_code=None):
 
     meta.update(derive_report_period(os.path.basename(pdf_path), meta["period"]))
 
-    # Display/Legal name
-    m = re.search(r"Display name[:\s]+(\S+)", full_text)
-    if m: meta["display_name"] = m.group(1)
-    m = re.search(r"Anzeigename[:\s]+(\S+)", full_text)
-    if m: meta["display_name"] = m.group(1)
-    m = re.search(r"Legal name[:\s]+(\S+)", full_text)
-    if m: meta["legal_name"] = m.group(1)
-    m = re.search(r"Eingetragener Firmenname[:\s]+(\S+)", full_text)
-    if m: meta["legal_name"] = m.group(1)
+    # Display/Legal name: use positioned rows, because PDF text order can place
+    # the legal-name value next to the display-name label in plain text.
+    names = extract_names_from_positioned_words(all_words)
+    meta["display_name"] = names["display_name"]
+    meta["legal_name"] = names["legal_name"]
+    if meta["display_name"]:
+        meta["store"] = meta["display_name"]
+        meta["store_source"] = "pdf_display_name"
+        if store and store.lower() != meta["display_name"].lower():
+            meta["store_audit_status"] = f"文件名/目录店铺 {store} 与 PDF Display name {meta['display_name']} 不一致，已采用 PDF 正文"
+        else:
+            meta["store_audit_status"] = "✓ 文件名/目录店铺与 PDF Display name 一致"
+    else:
+        meta["store_audit_status"] = "未从 PDF 正文解析到 Display name，已采用文件名/目录"
+
+    pdf_country_code = infer_pdf_country_code(meta["currency"], meta["period"])
+    meta["pdf_country_code"] = pdf_country_code
+    if pdf_country_code:
+        if meta["country_code"] and str(meta["country_code"]).upper() != pdf_country_code:
+            meta["country_audit_status"] = f"文件名/目录国家 {meta['country']}({meta['country_code']}) 与 PDF 货币/时区推断 {CODE_TO_COUNTRY_NAME.get(pdf_country_code, pdf_country_code)}({pdf_country_code}) 不一致"
+            meta["country_code"] = pdf_country_code
+            meta["country"] = CODE_TO_COUNTRY_NAME.get(pdf_country_code, pdf_country_code)
+        else:
+            meta["country_audit_status"] = f"✓ 国家与 PDF 货币/时区推断一致：{CODE_TO_COUNTRY_NAME.get(pdf_country_code, pdf_country_code)}({pdf_country_code})"
+        meta["country_source"] = "currency_or_timezone_cross_check"
+    else:
+        meta["country_audit_status"] = "PDF 未提供足够唯一的国家线索，已采用文件名/目录国家"
 
     COL_SPLIT = 395
 
@@ -1191,27 +1258,52 @@ def extract_pdf(pdf_path, store, country, country_code=None):
 
 def collect_pdfs(base_dir):
     pdfs = []
-    for store in sorted(os.listdir(base_dir)):
-        sp = os.path.join(base_dir, store)
-        if not os.path.isdir(sp) or store.startswith(".") or store in ("script", "outputs"): continue
-        for root, dirs, files in os.walk(sp):
-            dirs[:] = sorted([d for d in dirs if not d.startswith(".")])
-            for fname in sorted(files):
-                if not fname.lower().endswith(".pdf"): continue
-                if re.search(r"Q[1-4]-Q[1-4]", fname, re.IGNORECASE): continue
-                pdf_path = os.path.join(root, fname)
-                qname = re.search(r"^(.+?)-([A-Z]{2})-\d{4}Q[1-4](?:-Q[1-4])?\b", fname, re.IGNORECASE)
-                m = re.search(r"-([A-Z]{2})-\d{4}Q\d", fname, re.IGNORECASE)
-                country_name = Path(root).name
-                filename_country = next((name for name in COUNTRY_NAME_TO_CODE if name in fname), None)
-                if filename_country:
-                    country_name = filename_country
-                cc = m.group(1).upper() if m else COUNTRY_NAME_TO_CODE.get(country_name, "XX")
-                inferred_store = qname.group(1) if qname else store
-                if country_name not in COUNTRY_NAME_TO_CODE and qname:
-                    country_name = CODE_TO_COUNTRY_NAME.get(cc, country_name)
-                pdfs.append((pdf_path, inferred_store, country_name, cc))
+    base_path = Path(base_dir)
+    for pdf_path in sorted(base_path.rglob("*.pdf")):
+        if any(part.startswith(".") or part in ("script", "outputs") for part in pdf_path.relative_to(base_path).parts):
+            continue
+        fname = pdf_path.name
+        if re.search(r"Q[1-4]-Q[1-4]", fname, re.IGNORECASE):
+            continue
+
+        relative_parts = pdf_path.relative_to(base_path).parts
+        directory_parts = relative_parts[:-1]
+        qname = re.search(r"^(.+?)-([A-Z]{2})-\d{4}Q[1-4](?:-Q[1-4])?\b", fname, re.IGNORECASE)
+        code_match = re.search(r"-([A-Z]{2})-\d{4}Q\d", fname, re.IGNORECASE)
+
+        filename_country = next((name for name in COUNTRY_NAME_TO_CODE if name in fname), None)
+        path_country = _infer_country_from_path(directory_parts)
+        country_name = filename_country or path_country or (directory_parts[-1] if directory_parts else "")
+        cc = code_match.group(1).upper() if code_match else COUNTRY_NAME_TO_CODE.get(country_name, "XX")
+        if country_name not in COUNTRY_NAME_TO_CODE and cc != "XX":
+            country_name = CODE_TO_COUNTRY_NAME.get(cc, country_name)
+
+        inferred_store = qname.group(1) if qname else _infer_store_from_path(directory_parts, country_name, base_path.name)
+        pdfs.append((str(pdf_path), inferred_store, country_name or "未知", cc))
     return pdfs
+
+
+def _infer_country_from_path(parts):
+    for part in reversed(parts):
+        if part in COUNTRY_NAME_TO_CODE:
+            return part
+    for part in reversed(parts):
+        matched = next((name for name in COUNTRY_NAME_TO_CODE if name in part), None)
+        if matched:
+            return matched
+    return ""
+
+
+def _infer_store_from_path(parts, country_name, fallback):
+    if not parts:
+        return fallback
+    for part in parts:
+        if part == country_name or part in COUNTRY_NAME_TO_CODE:
+            continue
+        if any(name in part for name in COUNTRY_NAME_TO_CODE):
+            continue
+        return part
+    return parts[0] if parts else fallback
 
 HEADERS = ["店铺","国家/站点","站点代码","货币","报告期","年份","月份","季度",
            "大类","原始字段","英文字段","中文标准字段",

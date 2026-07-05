@@ -14,9 +14,11 @@ from .models import RenamePlan, ShipmentRecord
 EXPORT_COLUMNS = [
     "原文件名",
     "标签类型",
+    "工厂/供应商",
     "工厂名",
     "物流单号",
     "文件名SKU",
+    "文件名产品名",
     "文件名国家",
     "文件名箱数",
     "文件名总数",
@@ -60,7 +62,7 @@ def build_suggested_filename(record: ShipmentRecord) -> str:
         safe_parts = [_sanitize_filename_part(part) for part in parts if part]
         return "-".join(safe_parts) + ".pdf"
 
-    product_name = record.title_product_name or record.product_name
+    product_name = record.filename_info.product_name or record.title_product_name or record.product_name
     factory_name = record.filename_info.factory_name
     total_part = f"{record.total_units}个" if record.total_units is not None else f"{record.box_count}箱"
     parts = [
@@ -110,9 +112,11 @@ def records_to_rows(records: list[ShipmentRecord]) -> list[dict]:
         {
             "原文件名": record.original_filename,
             "标签类型": _label_type_name(record.label_type),
+            "工厂/供应商": record.filename_info.factory_name,
             "工厂名": record.filename_info.factory_name,
             "物流单号": record.logistics_code or record.filename_info.logistics_code,
             "文件名SKU": record.filename_info.sku,
+            "文件名产品名": record.filename_info.product_name,
             "文件名国家": record.filename_info.country,
             "文件名箱数": record.filename_info.box_count,
             "文件名总数": record.filename_info.total_units,

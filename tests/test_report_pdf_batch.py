@@ -1,6 +1,9 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from app.amazon_toolbox.report_pdf.batch import _duplicate_report_keys, _result_row
+from app.amazon_toolbox.report_pdf.extract_amazon_reports import collect_pdfs
 
 
 class ReportPdfBatchTest(TestCase):
@@ -37,6 +40,32 @@ class ReportPdfBatchTest(TestCase):
         row = _result_row(result, duplicate_keys)
 
         self.assertEqual(row["status"], "疑似重复报告期")
+
+    def test_collect_pdfs_accepts_direct_root_pdfs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "Bikoney-US-2026Q2-summary.pdf").write_bytes(b"%PDF")
+
+            rows = collect_pdfs(str(base))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "Bikoney")
+        self.assertEqual(rows[0][2], "美国")
+        self.assertEqual(rows[0][3], "US")
+
+    def test_collect_pdfs_infers_brand_and_country_from_nested_folders(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            target = base / "TARNABY" / "欧洲" / "德国" / "202605-汇总报告.pdf"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"%PDF")
+
+            rows = collect_pdfs(str(base))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "TARNABY")
+        self.assertEqual(rows[0][2], "德国")
+        self.assertEqual(rows[0][3], "DE")
 
 
 def _fake_result(source_file: str) -> dict:

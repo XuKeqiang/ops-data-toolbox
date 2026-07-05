@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -111,6 +112,32 @@ class ShipmentPdfParsingTest(unittest.TestCase):
         self.assertEqual(info.country, "美国")
         self.assertEqual(info.notes, ())
 
+    def test_parse_underscore_filename_keeps_supplier_name(self):
+        info = parse_filename_info("晟通_2000301_舒曼收纳架（加拿大站）_50箱_50个_XYY4_FBA19H5JJ81N(1-50)_加拿大.pdf")
+
+        self.assertEqual(info.factory_name, "晟通")
+        self.assertEqual(info.sku, "2000301")
+        self.assertEqual(info.product_name, "舒曼收纳架（加拿大站）")
+        self.assertEqual(info.box_count, 50)
+        self.assertEqual(info.total_units, 50)
+        self.assertEqual(info.warehouse, "XYY4")
+        self.assertEqual(info.fba_code, "FBA19H5JJ81N")
+        self.assertEqual(info.country, "加拿大")
+        self.assertEqual(info.notes, ())
+
+    def test_parse_underscore_filename_keeps_product_quantity_words(self):
+        info = parse_filename_info("鹏鑫达_2002701_多芬 2个装 烧火色桐木（加拿大站）_11箱_231个_XYY4_FBA19H5JJ81N(216-226)_加拿大.pdf")
+
+        self.assertEqual(info.factory_name, "鹏鑫达")
+        self.assertEqual(info.sku, "2002701")
+        self.assertEqual(info.product_name, "多芬 2个装 烧火色桐木（加拿大站）")
+        self.assertEqual(info.box_count, 11)
+        self.assertEqual(info.total_units, 231)
+        self.assertEqual(info.warehouse, "XYY4")
+        self.assertEqual(info.fba_code, "FBA19H5JJ81N")
+        self.assertEqual(info.country, "加拿大")
+        self.assertEqual(info.notes, ())
+
     def test_parse_forwarder_filename_info(self):
         info = parse_filename_info("沙特-FASA202605228410S（1-20）晟通.pdf")
 
@@ -144,6 +171,39 @@ class ShipmentPdfParsingTest(unittest.TestCase):
             "晟通-FASA202605228410S-2箱-JED4-FBA15LSJCSYS-沙特.pdf",
         )
 
+    def test_standard_label_keeps_declared_shipment_total_as_context(self):
+        record = parse_label_text(
+            source_path=Path("晟通_2000301_舒曼收纳架_50箱_50个_XYY4_FBA19H5JJ81N(1-50)_加拿大.pdf"),
+            page_texts=[
+                AU_LABEL_TEXT.replace("共 1 个纸箱", "共 356 个纸箱"),
+                AU_LABEL_TEXT.replace("共 1 个纸箱", "共 356 个纸箱").replace("U000001", "U000002"),
+            ],
+        )
+
+        self.assertEqual(record.box_count, 2)
+        self.assertEqual(record.shipment_total_boxes, 356)
+        self.assertNotIn("纸箱总数 356 与 PDF 页数 2 不一致", record.notes)
+
+    def test_suggested_filename_and_export_keep_supplier_name(self):
+        record = parse_label_text(
+            source_path=Path("晟通_2000301_舒曼收纳架（加拿大站）_50箱_50个_XYY4_FBA19H5JJ81N(1-50)_加拿大.pdf"),
+            page_texts=[AU_LABEL_TEXT],
+        )
+        rows = shipment_batch.records_to_rows([record])
+
+        self.assertTrue(build_suggested_filename(record).startswith("晟通-"))
+        self.assertEqual(rows[0]["工厂/供应商"], "晟通")
+        self.assertEqual(rows[0]["工厂名"], "晟通")
+        self.assertEqual(rows[0]["文件名产品名"], "舒曼收纳架（加拿大站）")
+
+    def test_suggested_filename_prefers_filename_product_name(self):
+        record = parse_label_text(
+            source_path=Path("鹏鑫达_2002701_多芬 2个装 烧火色桐木（加拿大站）_11箱_231个_XYY4_FBA19H5JJ81N(216-226)_加拿大.pdf"),
+            page_texts=[AU_LABEL_TEXT.replace("3006502", "2002701")],
+        )
+
+        self.assertIn("多芬 2个装 烧火色桐木（加拿大站）", build_suggested_filename(record))
+
     def test_filename_comparison_marks_total_mismatch(self):
         record = parse_label_text(
             source_path=Path("鹏鑫达-3006502-达利白-40-BWU2-FBA15GCL9X61-澳大利亚.pdf"),
@@ -161,7 +221,7 @@ class ShipmentPdfParsingTest(unittest.TestCase):
 
         self.assertEqual(
             build_suggested_filename(record),
-            "鹏鑫达-3006502-达利白色-1个-BWU2-FBA15GCL9X61-澳大利亚.pdf",
+            "鹏鑫达-3006502-达利白-1个-BWU2-FBA15GCL9X61-澳大利亚.pdf",
         )
 
     def test_rename_plan_skips_invalid_and_conflicting_rows(self):
@@ -237,6 +297,45 @@ class ShipmentPdfParsingTest(unittest.TestCase):
             target.write_text("existing", encoding="utf-8")
 
             self.assertEqual(server._unique_upload_target(target).name, "same-2.pdf")
+
+    def test_build_shipment_package_bundle_contains_factory_zips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_paths = []
+            for name in ("晟通-batch.zip", "华越-batch.zip"):
+                zip_path = root / name
+                with zipfile.ZipFile(zip_path, "w") as archive:
+                    archive.writestr("placeholder.pdf", "pdf")
+                package_paths.append(zip_path)
+
+            bundle = server._build_shipment_package_bundle(
+                "batch001",
+                [{"zip_filename": path.name, "zip_path": str(path)} for path in package_paths],
+                str(root),
+            )
+
+            self.assertEqual(bundle["zip_filename"], "全部工厂-batch001.zip")
+            with zipfile.ZipFile(bundle["zip_path"]) as archive:
+                self.assertEqual(set(archive.namelist()), {"晟通-batch.zip", "华越-batch.zip"})
+
+    def test_history_payload_enriches_shipment_package_downloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_root = root / "task001-factory-packages"
+            package_root.mkdir()
+            for name in ("晟通-task001.zip", "华越-task001.zip"):
+                with zipfile.ZipFile(package_root / name, "w") as archive:
+                    archive.writestr("placeholder.pdf", "pdf")
+
+            with patch.object(server, "OUTPUT_ROOT", root):
+                task = server._task_with_available_downloads(
+                    {"id": "task001", "type": "shipment_pdf", "downloads": []}
+                )
+
+            labels = {item["label"] for item in task["downloads"]}
+            self.assertIn("全部工厂压缩包", labels)
+            self.assertIn("晟通 压缩包", labels)
+            self.assertTrue((package_root / "全部工厂-task001.zip").exists())
 
 
 if __name__ == "__main__":

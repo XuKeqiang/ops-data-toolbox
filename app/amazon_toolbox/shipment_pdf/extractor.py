@@ -117,8 +117,8 @@ def parse_label_text(source_path: Path, page_texts: list[str] | tuple[str, ...])
         notes.append("未识别到 FBA 物流编码")
     if carton_codes and len(carton_codes) != box_count:
         notes.append(f"箱码数量 {len(carton_codes)} 与 PDF 页数 {box_count} 不一致")
-    if claimed_total is not None and claimed_total != box_count:
-        notes.append(f"纸箱总数 {claimed_total} 与 PDF 页数 {box_count} 不一致")
+    if claimed_total is not None and claimed_total < box_count:
+        notes.append(f"PDF 声明纸箱总数 {claimed_total} 小于 PDF 页数 {box_count}")
 
     filename_info = parse_filename_info(source_path.name)
     comparison_notes = compare_filename_info(
@@ -144,6 +144,7 @@ def parse_label_text(source_path: Path, page_texts: list[str] | tuple[str, ...])
         is_single_sku=is_single_sku,
         quantity_per_box=quantity_per_box,
         total_units=total_units,
+        shipment_total_boxes=claimed_total,
         label_title=label_title,
         title_product_name=title_product_name,
         created_at=created_at,
@@ -158,6 +159,9 @@ def parse_filename_info(filename: str) -> FilenameShipmentInfo:
     forwarder_info = _parse_forwarder_filename_info(stem)
     if forwarder_info:
         return forwarder_info
+    underscore_info = _parse_underscore_filename_info(stem)
+    if underscore_info:
+        return underscore_info
 
     parts = [part.strip() for part in re.split(r"[-－—–]+", stem) if part.strip()]
     notes: list[str] = []
@@ -209,6 +213,77 @@ def parse_filename_info(filename: str) -> FilenameShipmentInfo:
         notes.append("文件名未识别到 SKU")
 
     product_name = "-".join(product_parts).strip()
+    if not product_name:
+        notes.append("文件名未识别到产品名")
+
+    return FilenameShipmentInfo(
+        factory_name=factory_name,
+        logistics_code="",
+        sku=sku,
+        product_name=product_name,
+        country=country,
+        warehouse=warehouse,
+        fba_code=fba_code,
+        box_count=box_count,
+        total_units=total_units,
+        notes=tuple(notes),
+    )
+
+
+def _parse_underscore_filename_info(stem: str) -> FilenameShipmentInfo | None:
+    if "_" not in stem and "＿" not in stem:
+        return None
+
+    parts = [part.strip() for part in re.split(r"[_＿]+", stem) if part.strip()]
+    if len(parts) < 7:
+        return None
+
+    notes: list[str] = []
+    factory_name = parts[0]
+    if not factory_name:
+        notes.append("文件名未识别到工厂/供应商")
+
+    sku = parts[1] if len(parts) > 1 else ""
+    if not sku:
+        notes.append("文件名未识别到 SKU")
+
+    country = _normalize_filename_country(parts[-1])
+    if not country:
+        notes.append("文件名未识别到国家")
+
+    fba_index = next((idx for idx in range(len(parts) - 2, -1, -1) if parts[idx].upper().startswith("FBA")), -1)
+    if fba_index <= 0:
+        notes.append("文件名未识别到 FBA 编码")
+        fba_code = ""
+        warehouse = ""
+    else:
+        fba_match = FBA_BASE_RE.search(parts[fba_index].upper())
+        fba_code = fba_match.group(0)[:12] if fba_match else parts[fba_index].upper()[:12]
+        warehouse = parts[fba_index - 1].upper() if fba_index >= 1 else ""
+        if warehouse and not WAREHOUSE_TOKEN_RE.match(warehouse):
+            notes.append("文件名仓库格式可能异常")
+
+    box_count = None
+    total_units = None
+    quantity_indices: list[int] = []
+    quantity_scan_end = fba_index - 1 if fba_index > 0 else len(parts) - 1
+    for index in range(2, max(2, quantity_scan_end)):
+        token = parts[index]
+        token_box_count, token_total_units = _parse_strict_filename_quantity_token(token)
+        if token_box_count is not None:
+            box_count = token_box_count
+            quantity_indices.append(index)
+        if token_total_units is not None:
+            total_units = token_total_units
+            quantity_indices.append(index)
+
+    if not quantity_indices:
+        notes.append("文件名未识别到箱数或总数")
+        product_parts = parts[2:quantity_scan_end]
+    else:
+        product_parts = parts[2:min(quantity_indices)]
+
+    product_name = "_".join(product_parts).strip()
     if not product_name:
         notes.append("文件名未识别到产品名")
 
@@ -407,6 +482,19 @@ def _parse_quantity_token(token: str) -> tuple[int | None, int | None]:
     if unit_match:
         total_units = int(unit_match.group(1))
     if NUMERIC_TOKEN_RE.match(text):
+        total_units = int(text)
+    return box_count, total_units
+
+
+def _parse_strict_filename_quantity_token(token: str) -> tuple[int | None, int | None]:
+    text = token.strip()
+    box_count = None
+    total_units = None
+    if re.fullmatch(r"\d+\s*箱", text):
+        box_count = int(re.search(r"\d+", text).group(0))
+    elif re.fullmatch(r"\d+\s*个", text):
+        total_units = int(re.search(r"\d+", text).group(0))
+    elif NUMERIC_TOKEN_RE.fullmatch(text):
         total_units = int(text)
     return box_count, total_units
 

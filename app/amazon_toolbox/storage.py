@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +106,31 @@ def get_task(path: Path, task_id: str) -> dict[str, Any] | None:
     with _connect(path) as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return _task_from_row(row) if row else None
+
+
+def delete_task(path: Path, task_id: str) -> bool:
+    init_db(path)
+    with _connect(path) as conn:
+        cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.execute("DELETE FROM export_records WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM operation_logs WHERE target_id = ?", (task_id,))
+    return cursor.rowcount > 0
+
+
+def prune_tasks(path: Path, user: dict[str, Any], days: int) -> list[dict[str, Any]]:
+    init_db(path)
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    sql = "SELECT * FROM tasks WHERE created_at < ?"
+    params: list[Any] = [cutoff]
+    if user.get("role") != "admin":
+        sql += " AND owner_id = ?"
+        params.append(user.get("id", ""))
+    with _connect(path) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    tasks = [_task_from_row(row) for row in rows]
+    for task in tasks:
+        delete_task(path, task["id"])
+    return tasks
 
 
 def update_task_downloads(path: Path, task_id: str, downloads: list[dict[str, Any]]) -> None:

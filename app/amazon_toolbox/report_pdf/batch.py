@@ -17,6 +17,51 @@ class ReportPdfJob:
     rows: list[dict]
 
 
+def preflight_report_folder(folder: Path) -> dict:
+    pdfs = report_parser.collect_pdfs(str(folder))
+    issues: list[dict] = []
+    preview_rows: list[dict] = []
+    for pdf_path, store, country, country_code in pdfs:
+        try:
+            result = report_parser.extract_pdf(pdf_path, store, country, country_code)
+            meta = result["meta"]
+            row_issues = []
+            for key in ("store_audit_status", "country_audit_status", "filename_audit_status"):
+                value = meta.get(key) or ""
+                if value and not value.startswith("✓") and "足够唯一" not in value:
+                    row_issues.append(value)
+            row = {
+                "source_file": Path(pdf_path).name,
+                "filename_store": meta.get("filename_store") or store,
+                "pdf_store": meta.get("display_name") or "",
+                "store": meta.get("store") or "",
+                "filename_country": meta.get("filename_country") or country,
+                "pdf_country_code": meta.get("pdf_country_code") or "",
+                "country": meta.get("country") or "",
+                "country_code": meta.get("country_code") or "",
+                "currency": meta.get("currency") or "",
+                "period": meta.get("period") or "",
+                "issues": row_issues,
+            }
+            preview_rows.append(row)
+            if row_issues:
+                issues.append(row)
+        except Exception as exc:
+            issues.append({
+                "source_file": Path(pdf_path).name,
+                "filename_store": store,
+                "filename_country": country,
+                "issues": [f"预检解析失败：{exc}"],
+            })
+    return {
+        "files": _count_pdf_files(folder),
+        "processable": len(pdfs),
+        "issues": issues,
+        "issue_count": len(issues),
+        "preview": preview_rows[:20],
+    }
+
+
 def process_report_folder(folder: Path, output_path: Path, job_id: str) -> ReportPdfJob:
     pdfs = report_parser.collect_pdfs(str(folder))
     all_pdf_count = _count_pdf_files(folder)
@@ -80,6 +125,14 @@ def _result_row(result: dict, duplicate_keys: dict[tuple, list[str]]) -> dict:
     if audit_status and not audit_status.startswith("✓"):
         status_parts.append("文件名需复核")
 
+    store_audit_status = meta.get("store_audit_status") or ""
+    if store_audit_status and not store_audit_status.startswith("✓"):
+        status_parts.append("店铺需复核")
+
+    country_audit_status = meta.get("country_audit_status") or ""
+    if country_audit_status and not country_audit_status.startswith("✓") and "足够唯一" not in country_audit_status:
+        status_parts.append("国家需复核")
+
     key = (
         meta.get("store"),
         meta.get("country_code"),
@@ -97,6 +150,10 @@ def _result_row(result: dict, duplicate_keys: dict[tuple, list[str]]) -> dict:
         notes.extend(result["errors"])
     if audit_status and not audit_status.startswith("✓"):
         notes.append(audit_status)
+    if store_audit_status and not store_audit_status.startswith("✓"):
+        notes.append(store_audit_status)
+    if country_audit_status and not country_audit_status.startswith("✓"):
+        notes.append(country_audit_status)
     if len(duplicates) > 1:
         notes.append("同店铺/站点/年月存在多个文件")
 
@@ -104,8 +161,15 @@ def _result_row(result: dict, duplicate_keys: dict[tuple, list[str]]) -> dict:
         "source_file": meta.get("source_file") or "",
         "source_path": meta.get("source_path") or "",
         "store": meta.get("store") or "",
+        "filename_store": meta.get("filename_store") or "",
+        "display_name": meta.get("display_name") or "",
+        "store_source": meta.get("store_source") or "",
         "country": meta.get("country") or "",
         "country_code": meta.get("country_code") or "",
+        "filename_country": meta.get("filename_country") or "",
+        "filename_country_code": meta.get("filename_country_code") or "",
+        "pdf_country_code": meta.get("pdf_country_code") or "",
+        "country_source": meta.get("country_source") or "",
         "currency": meta.get("currency") or "",
         "period": meta.get("period") or "",
         "year": meta.get("year"),
