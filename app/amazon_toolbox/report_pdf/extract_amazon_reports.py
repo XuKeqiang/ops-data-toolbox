@@ -1284,8 +1284,14 @@ def collect_pdfs(base_dir):
 
         relative_parts = pdf_path.relative_to(base_path).parts
         directory_parts = relative_parts[:-1]
+        # ---- 从文件名提取品牌名（优先级：文件名品牌 > 目录路径）----
+        # 模式 1：旧格式 STORE-XX-YYYYQn（如 Anker-US-2026Q1）
         qname = re.search(r"^(.+?)-([A-Z]{2})-\d{4}Q[1-4](?:-Q[1-4])?\b", fname, re.IGNORECASE)
         code_match = re.search(r"-([A-Z]{2})-\d{4}Q\d", fname, re.IGNORECASE)
+        # 模式 2：YYYYMM-品牌-国家（如 202601-Bikoney-加拿大-汇总报告.pdf）
+        fn_brand = None
+        if not qname:
+            fn_brand = re.search(r"\b(\d{4})(?:0[1-9]|1[0-2])-(.+?)-", fname)
 
         filename_country = next((name for name in COUNTRY_NAME_TO_CODE if name in fname), None)
         path_country = _infer_country_from_path(directory_parts)
@@ -1294,7 +1300,12 @@ def collect_pdfs(base_dir):
         if country_name not in COUNTRY_NAME_TO_CODE and cc != "XX":
             country_name = CODE_TO_COUNTRY_NAME.get(cc, country_name)
 
-        inferred_store = qname.group(1) if qname else _infer_store_from_path(directory_parts, country_name, base_path.name)
+        # 优先级：文件名模式1(旧) > 文件名模式2(YYYYMM-品牌) > 目录路径推断
+        inferred_store = (
+            qname.group(1) if qname
+            else (fn_brand.group(2).strip() if fn_brand
+                  else _infer_store_from_path(directory_parts, country_name, base_path.name))
+        )
         pdfs.append((str(pdf_path), inferred_store, country_name or "未知", cc))
     return pdfs
 
