@@ -448,6 +448,30 @@ Windows 示例：
 ]
 ```
 
+### 更新脚本看起来没反应
+
+先确认是在终端或 PowerShell 里运行脚本，不要双击脚本文件。双击可能一闪而过，看不到 GitHub 网络、Python 依赖或重启服务的输出。
+
+如果部署机器上还是旧版更新脚本，先手动拉一次代码：
+
+macOS：
+
+```bash
+cd ~/Documents/amazon-ops-toolbox
+git pull --ff-only
+bash scripts/update.sh
+```
+
+Windows PowerShell：
+
+```powershell
+cd $HOME\Documents\amazon-ops-toolbox
+git pull --ff-only
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\update.ps1
+```
+
+新版更新脚本会显示项目目录、当前版本、远程仓库、拉取进度、依赖安装进度和服务重启结果。如果停在某一步，把终端里的文字或截图发给维护人员即可定位。
+
 ### 汇总报告 PDF 店铺名提醒是什么意思
 
 汇总报告 PDF 会优先使用文件名或文件夹里的店铺名，方便按团队交付口径汇总。PDF 正文里的 `Display name` 更适合做核验来源。
