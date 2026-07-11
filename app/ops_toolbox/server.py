@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import shutil
 import subprocess
 import sys
@@ -386,14 +387,21 @@ class AmazonToolboxHandler(BaseHTTPRequestHandler):
         log_path = DATA_ROOT / "logs" / "web-update.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_handle = log_path.open("ab")
+        popen_options = {
+            "cwd": PROJECT_ROOT,
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_handle,
+            "stderr": subprocess.STDOUT,
+        }
+        if os.name == "nt":
+            popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            popen_options["close_fds"] = True
+        else:
+            popen_options["start_new_session"] = True
         try:
             subprocess.Popen(
                 [sys.executable, str(PROJECT_ROOT / "scripts" / "web-update-runner.py"), token],
-                cwd=PROJECT_ROOT,
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+                **popen_options,
             )
         finally:
             log_handle.close()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -13,6 +14,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STATUS_PATH = ROOT / "data" / "web-update-status.json"
+
+
+def update_command(platform_name: str | None = None) -> list[str]:
+    platform_name = platform_name or os.name
+    if platform_name == "nt":
+        return [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            r".\scripts\update.ps1",
+        ]
+    return ["bash", "scripts/update.sh"]
 
 
 def write_status(token: str, phase: str, message: str) -> None:
@@ -36,7 +51,7 @@ def main() -> int:
     write_status(token, "running", "正在拉取远端代码并更新依赖")
     try:
         result = subprocess.run(
-            ["bash", "scripts/update.sh"],
+            update_command(),
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,

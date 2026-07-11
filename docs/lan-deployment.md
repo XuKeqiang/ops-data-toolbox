@@ -182,6 +182,15 @@ data/logs/server.err.log
 
 ## 更新代码
 
+首次部署或尚未安装网页更新功能时，需要在部署机手动执行一次下方更新脚本。之后管理员可在“系统设置 → 系统更新”中检查并应用新版本。
+
+网页更新会根据部署系统自动选择：
+
+- macOS/Linux：`scripts/update.sh`
+- Windows：`scripts/update.ps1`
+
+更新前会拒绝有未提交改动或分支分叉的部署目录，更新过程会重启服务。执行记录保存在 `data/logs/web-update.log`。
+
 推荐流程：
 
 1. 在开发电脑完成修改和测试。

@@ -43,6 +43,8 @@ python --version
 
 ### 3. 拉取项目代码
 
+`git clone` 会自动新建 `ops-data-toolbox` 项目文件夹，不需要先手动创建同名文件夹。建议使用 Git 拉取，不要下载 GitHub ZIP，否则后续无法使用自动更新。
+
 macOS：
 
 ```bash
@@ -60,6 +62,8 @@ cd ops-data-toolbox
 ```
 
 以后所有操作都在这个 `ops-data-toolbox` 文件夹里执行。
+
+如果 Windows 提示无权限执行脚本，不需要修改全局策略，继续使用本文中带有 `-ExecutionPolicy Bypass` 的命令即可。
 
 ### 4. 安装 Python 依赖
 
@@ -277,6 +281,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\backup.ps1
 汇总报告 PDF 的店铺名以文件名或文件夹中推断出的店铺名为主。PDF 正文里的 `Display name` 只用于核验：如果文件名店铺名和 PDF 店铺名首字母不一致，系统会在预检日志和确认弹窗里提醒，用户确认后才继续生成 Excel。
 
 ## 日常更新代码
+
+### 在网页中自动更新（推荐）
+
+部署机至少需要手动拉取到包含“系统更新”功能的版本一次。之后管理员可以：
+
+1. 登录 Pulse。
+2. 打开“系统设置 → 系统更新”。
+3. 点击“检查更新”，查看当前版本和远程版本。
+4. 发现新版本后点击“立即更新”，阅读提示并二次确认。
+5. 等待代码拉取、依赖安装和服务重启完成，然后重新登录。
+
+网页更新在 macOS/Linux 上自动调用 `scripts/update.sh`，在 Windows 上自动调用 `scripts/update.ps1`。它会先检查 Git 状态；如果部署机有未提交改动、分支分叉或无法访问 GitHub，会停止更新并显示原因，不会覆盖本地数据。
+
+更新期间服务会短暂中断。页面会持续检查恢复状态；如果更新失败，可查看：
+
+```text
+data/logs/web-update.log
+```
+
+### 在服务器上手动更新
 
 当 GitHub 仓库有新版本时，在服务器电脑执行：
 

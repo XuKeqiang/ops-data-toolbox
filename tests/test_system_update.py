@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,22 @@ from unittest.mock import patch
 from app.ops_toolbox import server
 
 
+RUNNER_PATH = Path(__file__).resolve().parents[1] / "scripts" / "web-update-runner.py"
+RUNNER_SPEC = importlib.util.spec_from_file_location("web_update_runner", RUNNER_PATH)
+assert RUNNER_SPEC and RUNNER_SPEC.loader
+web_update_runner = importlib.util.module_from_spec(RUNNER_SPEC)
+RUNNER_SPEC.loader.exec_module(web_update_runner)
+
+
 class SystemUpdateTest(unittest.TestCase):
+    def test_runner_uses_powershell_on_windows(self) -> None:
+        command = web_update_runner.update_command("nt")
+        self.assertEqual(command[0], "powershell.exe")
+        self.assertIn(r".\scripts\update.ps1", command)
+
+    def test_runner_uses_bash_on_macos_and_linux(self) -> None:
+        self.assertEqual(web_update_runner.update_command("posix"), ["bash", "scripts/update.sh"])
+
     def test_check_reports_remote_update(self) -> None:
         values = {
             ("branch", "--show-current"): "main",
