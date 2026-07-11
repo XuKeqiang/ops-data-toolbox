@@ -9,10 +9,10 @@ $StartAction = New-ScheduledTaskAction `
   -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$StartScript`""
 $StartTrigger = New-ScheduledTaskTrigger -AtLogOn
 Register-ScheduledTask `
-  -TaskName "AmazonOpsToolboxServer" `
+  -TaskName "OpsToolboxServer" `
   -Action $StartAction `
   -Trigger $StartTrigger `
-  -Description "Start Amazon Operations Toolbox at user logon." `
+  -Description "Start Ops Toolbox at user logon." `
   -Force | Out-Null
 
 $BackupAction = New-ScheduledTaskAction `
@@ -20,12 +20,12 @@ $BackupAction = New-ScheduledTaskAction `
   -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$BackupScript`""
 $BackupTrigger = New-ScheduledTaskTrigger -Daily -At 2:30am
 Register-ScheduledTask `
-  -TaskName "AmazonOpsToolboxBackup" `
+  -TaskName "OpsToolboxBackup" `
   -Action $BackupAction `
   -Trigger $BackupTrigger `
-  -Description "Back up Amazon Operations Toolbox data daily." `
+  -Description "Back up Ops Toolbox data daily." `
   -Force | Out-Null
 
-Write-Host "Installed Windows scheduled task: AmazonOpsToolboxServer"
-Write-Host "Installed Windows scheduled task: AmazonOpsToolboxBackup"
+Write-Host "Installed Windows scheduled task: OpsToolboxServer"
+Write-Host "Installed Windows scheduled task: OpsToolboxBackup"
 Write-Host "The service starts at user logon and backup runs daily at 02:30."

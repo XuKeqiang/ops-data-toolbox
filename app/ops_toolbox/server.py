@@ -1970,12 +1970,12 @@ def run(host: str | None = None, port: int | None = None) -> None:
     ensure_user_store(USER_STORE)
     init_db(DATABASE_PATH)
     server = ThreadingHTTPServer((host, port), AmazonToolboxHandler)
-    print(f"Amazon Operations Toolbox running at http://{host}:{port}/")
+    print(f"Ops Toolbox running at http://{host}:{port}/")
     server.serve_forever()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Amazon Operations Toolbox")
+    parser = argparse.ArgumentParser(description="Ops Toolbox")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args()

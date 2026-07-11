@@ -1,4 +1,4 @@
-# Amazon Operations Toolbox Design
+# Ops Toolbox Design
 
 ## Goal
 
