@@ -51,11 +51,46 @@ SUMMARY_COLUMNS = [
 
 DETAIL_BASE_COLUMNS = [
     "来源文件",
-    "Invoice No.\n发票号",
-    "Remark\n备注",
+    "Invoice No.",
+    "Remark",
     "柜号/箱号",
-    "Currency\n币种",
+    "Currency",
 ]
+
+HEADER_EN = {
+    "来源文件": "Source File",
+    "费用明细行数": "Detail Row Count",
+    "状态": "Status",
+    "问题说明": "Issues",
+    "柜号/箱号": "Container No.",
+}
+
+HEADER_CN = {
+    "来源文件": "来源文件",
+    "Invoice No.": "发票号",
+    "Issue Date": "开票日期",
+    "Reprinted Date": "重印日期",
+    "Ref No.": "参考号",
+    "Consignee": "收货人",
+    "Vessel": "船名",
+    "Voyage": "航次",
+    "ETD Date": "预计离港日期",
+    "Destination": "目的地",
+    "Load Port": "装货港",
+    "Discharge Port": "卸货港",
+    "Total Cartons": "总箱数",
+    "Total CBM": "总体积（立方米）",
+    "Master B/L": "主提单号",
+    "FCR No.": "货运收据号",
+    "Remark": "备注",
+    "Prepared By": "制单人",
+    "Currency": "币种",
+    "Invoice Amount": "发票金额",
+    "费用明细行数": "费用明细行数",
+    "状态": "状态",
+    "问题说明": "问题说明",
+    "柜号/箱号": "柜号/箱号",
+}
 
 FEE_DESCRIPTION_CN = {
     "CFS RECEIVING CHARGE (CBM)": "CFS 收货费（按立方米）",
@@ -218,42 +253,50 @@ def extract_port_fee_invoice(path: Path) -> dict:
 
 def write_port_fee_excel(rows: list[dict], details: list[dict], output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    detail_rows, detail_columns = _pivot_fee_details(details)
+    detail_rows, detail_columns, detail_translations = _pivot_fee_details(details)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pd.DataFrame(rows, columns=SUMMARY_COLUMNS).to_excel(writer, sheet_name="发票汇总", index=False)
         pd.DataFrame(detail_rows, columns=detail_columns).to_excel(writer, sheet_name="费用明细", index=False)
-        _format_port_fee_worksheet(writer.sheets["发票汇总"], fixed_columns=SUMMARY_COLUMNS)
-        _format_port_fee_worksheet(writer.sheets["费用明细"], fixed_columns=DETAIL_BASE_COLUMNS)
+        _add_bilingual_header(writer.sheets["发票汇总"], SUMMARY_COLUMNS, HEADER_CN)
+        _add_bilingual_header(writer.sheets["费用明细"], detail_columns, {**HEADER_CN, **detail_translations})
     return output_path
 
 
-def _format_port_fee_worksheet(worksheet, fixed_columns: list[str]) -> None:
-    worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = worksheet.dimensions
+def _add_bilingual_header(worksheet, columns: list[str], translations: dict[str, str]) -> None:
+    worksheet.insert_rows(2)
+    worksheet.freeze_panes = "A3"
+    last_column = get_column_letter(len(columns))
+    worksheet.auto_filter.ref = f"A2:{last_column}{worksheet.max_row}"
     header_fill = PatternFill("solid", fgColor="D9EAF7")
-    for cell in worksheet[1]:
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    worksheet.row_dimensions[1].height = 45
-
-    for column_index, header_cell in enumerate(worksheet[1], start=1):
-        header = str(header_cell.value or "")
-        if header in fixed_columns:
-            width = max(14, min(24, max(len(part) for part in header.split("\n")) + 4))
+    for column_index, column in enumerate(columns, start=1):
+        english_header = HEADER_EN.get(column, column)
+        chinese_header = translations.get(column, column)
+        worksheet.cell(row=1, column=column_index, value=english_header)
+        worksheet.cell(row=2, column=column_index, value=chinese_header)
+        for row_index in (1, 2):
+            cell = worksheet.cell(row=row_index, column=column_index)
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if column in DETAIL_BASE_COLUMNS or column in SUMMARY_COLUMNS:
+            width = max(14, min(24, max(len(english_header), len(chinese_header) * 2) + 4))
         else:
             width = 30
         worksheet.column_dimensions[get_column_letter(column_index)].width = width
 
-    for row in worksheet.iter_rows(min_row=2):
+    worksheet.row_dimensions[1].height = 28
+    worksheet.row_dimensions[2].height = 28
+
+    for row in worksheet.iter_rows(min_row=3):
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=False)
 
 
-def _pivot_fee_details(details: list[dict]) -> tuple[list[dict], list[str]]:
+def _pivot_fee_details(details: list[dict]) -> tuple[list[dict], list[str], dict[str, str]]:
     """将同一张发票的费用项横向展开，便于核对各项港杂费。"""
     rows_by_invoice: dict[tuple[str, str, str, str], dict] = {}
     fee_columns: set[str] = set()
+    fee_translations: dict[str, str] = {}
 
     for detail in details:
         source_file = str(detail.get("来源文件", ""))
@@ -265,10 +308,10 @@ def _pivot_fee_details(details: list[dict]) -> tuple[list[dict], list[str]]:
             key,
             {
                 "来源文件": source_file,
-                "Invoice No.\n发票号": invoice_no,
-                "Remark\n备注": remark,
+                "Invoice No.": invoice_no,
+                "Remark": remark,
                 "柜号/箱号": [],
-                "Currency\n币种": currency,
+                "Currency": currency,
             },
         )
 
@@ -278,8 +321,9 @@ def _pivot_fee_details(details: list[dict]) -> tuple[list[dict], list[str]]:
 
         english_name = _fee_name_without_container(str(detail.get("费用描述", "")))
         chinese_name = _translate_fee_description(english_name)
-        column = f"{english_name}\n{chinese_name}" if english_name else "未识别费用项\n未识别费用项"
+        column = english_name or "Unrecognized Fee Item"
         fee_columns.add(column)
+        fee_translations[column] = chinese_name if english_name else "未识别费用项"
         amount = _decimal(detail.get("Amount")) or Decimal("0")
         row[column] = (row.get(column) or Decimal("0")) + amount
 
@@ -292,7 +336,7 @@ def _pivot_fee_details(details: list[dict]) -> tuple[list[dict], list[str]]:
             else:
                 row[column] = ""
         result.append(row)
-    return result, [*DETAIL_BASE_COLUMNS, *sorted(fee_columns)]
+    return result, [*DETAIL_BASE_COLUMNS, *sorted(fee_columns)], fee_translations
 
 
 def _fee_name_without_container(description: str) -> str:
