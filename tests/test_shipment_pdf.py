@@ -138,6 +138,75 @@ class ShipmentPdfParsingTest(unittest.TestCase):
         self.assertEqual(info.country, "加拿大")
         self.assertEqual(info.notes, ())
 
+    def test_parse_underscore_filename_detects_country_embedded_in_product_with_continent_suffix(self):
+        # 末段为「洲」（欧洲）而非国家，国家内嵌在产品名分段中
+        info = parse_filename_info(
+            "华越_120341_瑞思收纳架-英国_20箱_20个_BHX4_FBA15M107PW1（9-28）_欧洲.pdf"
+        )
+
+        self.assertEqual(info.factory_name, "华越")
+        self.assertEqual(info.sku, "120341")
+        self.assertEqual(info.product_name, "瑞思收纳架-英国")
+        self.assertEqual(info.country, "英国")
+        self.assertEqual(info.warehouse, "BHX4")
+        self.assertEqual(info.fba_code, "FBA15M107PW1")
+        self.assertEqual(info.notes, ())
+
+    def test_parse_underscore_filename_detects_country_across_hyphenated_product(self):
+        info = parse_filename_info(
+            "鹏鑫达_120231_卡蒂收纳架-泡白-英国_6箱_30个_DTM2_FBA15M0WS1B5_欧洲.pdf"
+        )
+
+        self.assertEqual(info.sku, "120231")
+        self.assertEqual(info.country, "英国")
+        self.assertEqual(info.notes, ())
+
+    def test_parse_label_text_falls_back_to_filename_when_pdf_text_lacks_sku_country(self):
+        # PDF 文本无法识别 SKU / 国家 / Single SKU，但文件名是权威来源
+        source_path = Path(
+            "华越_120341_瑞思收纳架-英国_1箱_1个_BHX4_FBA15M107PW1（9-28）_欧洲.pdf"
+        )
+        page_texts = [
+            "瑞思-BHX4 Created: 2026/09/28 10:00\n"
+            "FBA15M107PW1U000001\n"
+            "数量 1\n"
+            "瑞思收纳架\n"
+            "请不要遮住此标签\n"
+        ]
+
+        record = parse_label_text(source_path=source_path, page_texts=page_texts)
+
+        self.assertEqual(record.sku, "120341")
+        self.assertEqual(record.destination_country, "英国")
+        self.assertEqual(record.warehouse, "BHX4")
+        self.assertEqual(record.fba_code, "FBA15M107PW1")
+        self.assertTrue(record.is_single_sku)
+        self.assertEqual(record.notes, ())
+        self.assertTrue(record.is_valid)
+
+    def test_parse_label_text_prefers_pdf_sku_and_flags_mismatch(self):
+        source_path = Path(
+            "华越_120341_瑞思收纳架-英国_1箱_1个_BHX4_FBA15M107PW1（9-28）_欧洲.pdf"
+        )
+        page_texts = [
+            "9999999\n"
+            "瑞思-BHX4 Created: 2026/09/28 10:00\n"
+            "FBA15M107PW1U000001\n"
+            "数量 1\n"
+            "瑞思收纳架\n"
+            "Single SKU\n"
+            "请不要遮住此标签\n"
+        ]
+
+        record = parse_label_text(source_path=source_path, page_texts=page_texts)
+
+        # 顶层 sku 优先采用 PDF 文本识别到的值
+        self.assertEqual(record.sku, "9999999")
+        self.assertEqual(record.destination_country, "英国")
+        # PDF 与文件名 SKU 不一致 => 应产生对比提示而非静默通过
+        self.assertTrue(any("SKU不一致" in n for n in record.comparison_notes))
+        self.assertFalse(record.is_valid)
+
     def test_parse_forwarder_filename_info(self):
         info = parse_filename_info("沙特-FASA202605228410S（1-20）晟通.pdf")
 

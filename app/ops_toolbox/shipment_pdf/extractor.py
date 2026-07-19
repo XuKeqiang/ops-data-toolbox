@@ -73,6 +73,17 @@ COUNTRY_ALIASES = {
     "阿联酋": "阿联酋",
 }
 
+# 文件名末段有时是「洲」而非「国家」（如欧洲发货、国家内嵌在产品名中）
+CONTINENTS = {
+    "欧洲",
+    "美洲",
+    "北美洲",
+    "南美洲",
+    "亚洲",
+    "非洲",
+    "大洋洲",
+}
+
 
 def extract_pdf(path: Path) -> ShipmentRecord:
     with pdfplumber.open(path) as pdf:
@@ -90,18 +101,31 @@ def parse_label_text(source_path: Path, page_texts: list[str] | tuple[str, ...])
     carton_codes = tuple(dict.fromkeys(CARTON_RE.findall(all_text)))
     notes: list[str] = []
 
-    is_single_sku = "Single SKU" in all_text
-    sku = _first_match(SKU_RE, all_text)
+    pdf_has_single_sku = "Single SKU" in all_text
+    pdf_sku = _first_match(SKU_RE, all_text)
     first_page_text = page_texts[0] if page_texts else ""
     product_name = _extract_product_name(first_page_text)
     quantity_per_box = _extract_quantity_per_box(first_page_text)
-    label_title, title_product_name, title_warehouse, created_at = _extract_label_title(first_page_text, sku)
-    destination_country = _extract_country(all_text)
+    label_title, title_product_name, title_warehouse, created_at = _extract_label_title(first_page_text, pdf_sku)
+    pdf_country = _extract_country(all_text)
     warehouse = title_warehouse or _extract_warehouse(all_text)
     fba_code = carton_codes[0][:12] if carton_codes else ""
     box_count = len(page_texts)
     total_units = quantity_per_box * box_count if quantity_per_box is not None else None
     claimed_total = _extract_claimed_total(all_text)
+
+    filename_info = parse_filename_info(source_path.name)
+
+    # 当 PDF 文本无法识别关键字段时，回退到文件名（货件命名规范是这些字段的权威来源）。
+    # 文件名值在比较阶段不参与「不一致」判定：compare_filename_info 仍使用原始 PDF 值。
+    sku = pdf_sku or filename_info.sku
+    destination_country = pdf_country or filename_info.country
+
+    is_single_sku = pdf_has_single_sku
+    if not is_single_sku:
+        distinct_skus = {value for value in (sku, filename_info.sku) if value}
+        if len(distinct_skus) == 1:
+            is_single_sku = True
 
     if not is_single_sku:
         notes.append("未识别到 Single SKU")
@@ -120,11 +144,10 @@ def parse_label_text(source_path: Path, page_texts: list[str] | tuple[str, ...])
     if claimed_total is not None and claimed_total < box_count:
         notes.append(f"PDF 声明纸箱总数 {claimed_total} 小于 PDF 页数 {box_count}")
 
-    filename_info = parse_filename_info(source_path.name)
     comparison_notes = compare_filename_info(
         filename_info=filename_info,
-        pdf_sku=sku,
-        pdf_country=destination_country,
+        pdf_sku=pdf_sku,
+        pdf_country=pdf_country,
         pdf_warehouse=warehouse,
         pdf_fba_code=fba_code,
         pdf_box_count=box_count,
@@ -168,7 +191,7 @@ def parse_filename_info(filename: str) -> FilenameShipmentInfo:
     if len(parts) < 6:
         return FilenameShipmentInfo(notes=("文件名未匹配运营命名规范",))
 
-    country = _normalize_filename_country(parts[-1])
+    country = _detect_country_from_parts(parts)
     if not country:
         notes.append("文件名未识别到国家")
 
@@ -247,7 +270,7 @@ def _parse_underscore_filename_info(stem: str) -> FilenameShipmentInfo | None:
     if not sku:
         notes.append("文件名未识别到 SKU")
 
-    country = _normalize_filename_country(parts[-1])
+    country = _detect_country_from_parts(parts)
     if not country:
         notes.append("文件名未识别到国家")
 
@@ -507,6 +530,25 @@ def _normalize_filename_country(value: str) -> str:
     normalized = _normalize_country(value)
     if normalized in set(COUNTRY_ALIASES.values()):
         return normalized
+    return ""
+
+
+def _detect_country_from_parts(parts: list[str]) -> str:
+    """从文件名各分段（含产品名内以连字符分隔的子段）识别目的地国家。
+
+    文件名末段通常是国家；若末段是「洲」（如「欧洲」），则国家往往内嵌在产品名等其它分段中。
+    """
+    if parts:
+        country = _normalize_filename_country(parts[-1])
+        if country:
+            return country
+    last_is_continent = bool(parts) and parts[-1].strip() in CONTINENTS
+    candidates = parts[:-1] if last_is_continent else parts
+    for part in candidates:
+        for piece in re.split(r"[-－—–]+", part):
+            country = _normalize_filename_country(piece)
+            if country:
+                return country
     return ""
 
 
