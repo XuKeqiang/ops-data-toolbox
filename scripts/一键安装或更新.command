@@ -137,22 +137,42 @@ PLIST
   if [ "$mode" = "open" ]; then
     cat > "$app/Contents/MacOS/launcher" <<'LAUNCH'
 #!/usr/bin/env bash
-LABEL="com.ecom.ops-toolbox.server"
+# Pulse 启动器（TCC 安全版）
+# launchctl 在部分 TCC 环境中会返回假成功，因此最终统一以健康接口为准。
 PORT="8080"
 PROJECT_DIR="__ROOT_DIR__"
-launchctl kickstart "gui/$(id -u)/$LABEL" 2>/dev/null || bash "$PROJECT_DIR/scripts/start.sh" >/dev/null 2>&1
+LAUNCHD_LABEL="com.ecom.ops-toolbox.server"
+
+port_ready() {
+  curl -s -f -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/api/health" 2>/dev/null
+}
+
+# 已在运行时直接打开，避免重复启动造成短暂中断。
+if port_ready; then
+  /usr/bin/open "http://127.0.0.1:$PORT/"
+  exit 0
+fi
+
+# 部署机存在 watchdog 时确保它处于运行状态。
+if [ -f "$PROJECT_DIR/data/pulse-watchdog.sh" ] &&
+   ! pgrep -f "pulse-watchdog.sh" >/dev/null 2>&1; then
+  nohup bash "$PROJECT_DIR/data/pulse-watchdog.sh" >> "$PROJECT_DIR/data/logs/watchdog.log" 2>&1 &
+fi
+
+# 不依赖 launchctl 的返回码；无论其是否假成功，都显式执行启动脚本兜底。
+launchctl kickstart "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null
+bash "$PROJECT_DIR/scripts/start.sh" >/dev/null 2>&1
+
 READY=0
-for i in $(seq 1 20); do
-  if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
-    exec 3>&- 2>/dev/null; READY=1; break
-  fi
+for i in $(seq 1 30); do
+  if port_ready; then READY=1; break; fi
   sleep 0.5
 done
 if [ "$READY" -eq 1 ]; then
   /usr/bin/open "http://127.0.0.1:$PORT/"
   /usr/bin/osascript -e 'display notification "已打开 Pulse" with title "Pulse" sound name "Glass"'
 else
-  /usr/bin/osascript -e 'display notification "服务未就绪，请双击“更新”脚本或重启电脑" with title "Pulse" sound name "Basso"'
+  /usr/bin/osascript -e 'display notification "启动失败，请查看 data/logs/server.log" with title "Pulse" sound name "Basso"'
 fi
 LAUNCH
   else
