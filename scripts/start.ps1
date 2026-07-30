@@ -79,6 +79,16 @@ if (-not (Test-Path $VenvPython)) {
 }
 $Python = $VenvPython
 
+# ---- 健康检查 ----
+function Test-ServiceReady {
+  try {
+    $Response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/health" -UseBasicParsing -TimeoutSec 2
+    return $Response.StatusCode -eq 200
+  } catch {
+    return $false
+  }
+}
+
 # ---- 启动 ----
 $Arguments = @("-m", "app.ops_toolbox.server", "--port", $Port)
 if ($env:OPS_TOOLBOX_HOST) { $Arguments += @("--host", $env:OPS_TOOLBOX_HOST) }
@@ -94,11 +104,10 @@ $Process = Start-Process `
 
 Set-Content -Path $PidFile -Value $Process.Id
 
-# ---- 等待端口就绪（最多约 5 秒）----
+# ---- 等待健康接口就绪（最多约 15 秒）----
 $Ready = $false
-for ($i = 1; $i -le 10; $i++) {
-  $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-  if ($conn) { $Ready = $true; break }
+for ($i = 1; $i -le 30; $i++) {
+  if (Test-ServiceReady) { $Ready = $true; break }
   Start-Sleep -Milliseconds 500
 }
 
@@ -106,5 +115,5 @@ if ($Ready) {
   Write-Host "Ops Toolbox 已启动，PID $($Process.Id)，端口 $Port。"
   Write-Host "服务就绪：http://127.0.0.1:$Port/  （日志: $OutLog 和 $ErrLog）"
 } else {
-  Write-Host "警告：端口 $Port 在预期时间内未就绪，请查看日志：$ErrLog" -ForegroundColor Yellow
+  Write-Host "警告：健康接口在预期时间内未就绪，请查看日志：$ErrLog" -ForegroundColor Yellow
 }

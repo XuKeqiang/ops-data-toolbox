@@ -38,13 +38,28 @@ $LauncherScript = Join-Path $RootDir "scripts\launch-from-shortcut.ps1"
 # 从快捷方式启动（由 create-shortcut.ps1 生成）
 `$ErrorActionPreference = "Stop"
 Set-Location "$RootDir"
+
+function Test-ServiceReady {
+    try {
+        `$Response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/health" -UseBasicParsing -TimeoutSec 2
+        return `$Response.StatusCode -eq 200
+    } catch {
+        return `$false
+    }
+}
+
+# 已在运行时直接打开，避免重复点击导致服务重启。
+if (Test-ServiceReady) {
+    Start-Process "http://127.0.0.1:$Port/"
+    exit 0
+}
+
 & powershell -NoProfile -ExecutionPolicy Bypass -File "$RootDir\scripts\start.ps1" 2>`$null
 
-# 等待端口就绪
+# 等待健康接口就绪
 `$Ready = `$false
-for (`$i = 1; `$i -le 15; `$i++) {
-    `$conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    if (`$conn) { `$Ready = `$true; break }
+for (`$i = 1; `$i -le 30; `$i++) {
+    if (Test-ServiceReady) { `$Ready = `$true; break }
     Start-Sleep -Milliseconds 500
 }
 
